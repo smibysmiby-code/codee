@@ -1,0 +1,7 @@
+# Requirements for DQN UAV Task Offloading
+# =========================================
+# This project uses minimal dependencies for educational purposes.
+# The neural network is implemented from scratch (no PyTorch/TensorFlow needed!)
+
+numpy>=1.20.0
+matplotlib>=3.4.0
