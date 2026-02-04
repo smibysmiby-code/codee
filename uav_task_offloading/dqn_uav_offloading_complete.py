@@ -110,8 +110,8 @@ class GroundDevice:
         energy_coefficient: Energy consumption coefficient for local computing
     """
     cpu_frequency: float = 1e9      # 1 GHz (typical IoT device)
-    transmit_power: float = 0.5     # 0.5 Watts
-    energy_coefficient: float = 1e-28  # Energy per CPU cycle coefficient
+    transmit_power: float = 1.0     # 1.0 Watts (higher transmission cost!)
+    energy_coefficient: float = 1e-29  # Lower coefficient = cheaper local processing
 
 
 @dataclass
@@ -217,11 +217,14 @@ class UAVOffloadingEnv:
     def _setup_network(self):
         """Set up the network topology with devices and UAVs."""
         # Create ground devices with varying capabilities
+        # Key: Some devices have efficient local processing (low freq, low energy)
+        #      Transmission is costly (high power), so small tasks favor local
         self.devices = []
         for i in range(self.num_devices):
             device = GroundDevice(
-                cpu_frequency=np.random.uniform(1.5e9, 4e9),  # 1.5-4 GHz
-                transmit_power=np.random.uniform(0.5, 1.5),   # 0.5-1.5 W
+                cpu_frequency=np.random.uniform(1e9, 2e9),    # 1-2 GHz (energy efficient)
+                transmit_power=np.random.uniform(1.0, 2.0),   # 1-2 W (high transmission cost!)
+                energy_coefficient=np.random.uniform(5e-30, 2e-29),  # Low = efficient local
             )
             self.devices.append(device)
 
@@ -1066,18 +1069,26 @@ def main():
     TRAIN_EPISODES = 500
     EVAL_EPISODES = 100
 
+    # Reward weights - adjust these to prioritize delay vs energy
+    DELAY_WEIGHT = 0.3   # Lower weight for delay
+    ENERGY_WEIGHT = 0.7  # Higher weight for energy (prioritize energy saving!)
+
     print("CONFIGURATION:")
     print(f"  Ground Devices: {NUM_DEVICES}")
     print(f"  UAVs: {NUM_UAVS}")
     print(f"  Training Episodes: {TRAIN_EPISODES}")
     print(f"  Evaluation Episodes: {EVAL_EPISODES}")
+    print(f"  Delay Weight: {DELAY_WEIGHT}")
+    print(f"  Energy Weight: {ENERGY_WEIGHT} (prioritizing energy!)")
 
     # Create environment
     print("\n[1/4] Creating environment...")
     env = UAVOffloadingEnv(
         num_devices=NUM_DEVICES,
         num_uavs=NUM_UAVS,
-        episode_length=100
+        episode_length=100,
+        delay_weight=DELAY_WEIGHT,
+        energy_weight=ENERGY_WEIGHT
     )
 
     # Create DQN agent
