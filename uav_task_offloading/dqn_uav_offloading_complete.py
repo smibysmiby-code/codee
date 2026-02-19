@@ -72,9 +72,7 @@ from typing import Tuple, List, Dict
 import time
 import os
 
-# For plotting (use non-interactive backend)
-import matplotlib
-matplotlib.use('Agg')
+# For plotting
 import matplotlib.pyplot as plt
 
 
@@ -929,24 +927,36 @@ def compare_policies(env, dqn_agent, num_episodes=100):
 # PART 8: VISUALIZATION
 # ==============================================================================
 
-def plot_results(history, results, save_dir="./results"):
-    """Generate and save all plots."""
+def smooth(data, window=20):
+    """Smooth data using moving average for cleaner plots."""
+    smoothed = []
+    for i in range(len(data)):
+        start = max(0, i - window // 2)
+        end = min(len(data), i + window // 2)
+        smoothed.append(np.mean(data[start:end]))
+    return smoothed
+
+
+def plot_results(history, results, env, save_dir="./results"):
+    """
+    Generate all plots: saves to files AND displays on screen.
+
+    Creates 5 figures:
+    1. Training history (reward, delay, loss, epsilon)
+    2. Policy comparison bars (reward, delay, energy)
+    3. Offload ratio stacked bars
+    4. Energy comparison detail
+    5. Network topology map
+    """
     os.makedirs(save_dir, exist_ok=True)
-
-    # Plot 1: Training History
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    fig.suptitle('DQN Training Progress', fontsize=16, fontweight='bold')
-
     episodes = range(1, len(history['episode_rewards']) + 1)
+    policies = list(results.keys())
+    x = np.arange(len(policies))
+    colors = ['#2ecc71', '#e74c3c', '#3498db', '#9b59b6']
 
-    # Smoothing function
-    def smooth(data, window=20):
-        smoothed = []
-        for i in range(len(data)):
-            start = max(0, i - window // 2)
-            end = min(len(data), i + window // 2)
-            smoothed.append(np.mean(data[start:end]))
-        return smoothed
+    # ── FIGURE 1: Training History ───────────────────────────────────────
+    fig1, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig1.suptitle('DQN Training Progress', fontsize=16, fontweight='bold')
 
     # Rewards
     axes[0, 0].plot(episodes, history['episode_rewards'], alpha=0.3, color='blue')
@@ -965,84 +975,176 @@ def plot_results(history, results, save_dir="./results"):
     axes[0, 1].set_title('Episode Delays (Lower is Better)')
     axes[0, 1].grid(True, alpha=0.3)
 
-    # Loss
-    axes[1, 0].plot(episodes, history['losses'], alpha=0.3, color='green')
-    axes[1, 0].plot(episodes, smooth(history['losses']), color='green', linewidth=2)
+    # Energy over training
+    energies_mj = [e * 1000 for e in history['episode_energies']]
+    axes[1, 0].plot(episodes, energies_mj, alpha=0.3, color='orange')
+    axes[1, 0].plot(episodes, smooth(energies_mj), color='orange', linewidth=2)
     axes[1, 0].set_xlabel('Episode')
-    axes[1, 0].set_ylabel('Loss')
-    axes[1, 0].set_title('Training Loss')
+    axes[1, 0].set_ylabel('Energy (mJ)')
+    axes[1, 0].set_title('Episode Energy (Lower is Better)')
     axes[1, 0].grid(True, alpha=0.3)
 
-    # Epsilon
+    # Epsilon decay
     axes[1, 1].plot(episodes, history['epsilons'], color='purple', linewidth=2)
     axes[1, 1].set_xlabel('Episode')
     axes[1, 1].set_ylabel('Epsilon')
     axes[1, 1].set_title('Exploration Rate Decay')
+    axes[1, 1].axhline(y=0.01, color='gray', linestyle='--', alpha=0.5, label='Min epsilon')
+    axes[1, 1].legend()
     axes[1, 1].grid(True, alpha=0.3)
 
-    plt.tight_layout()
-    plt.savefig(f"{save_dir}/training_history.png", dpi=150)
-    plt.close()
+    fig1.tight_layout()
+    fig1.savefig(f"{save_dir}/1_training_history.png", dpi=150, bbox_inches='tight')
 
-    # Plot 2: Policy Comparison
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-    fig.suptitle('Policy Comparison', fontsize=16, fontweight='bold')
+    # ── FIGURE 2: Policy Comparison Bars ─────────────────────────────────
+    fig2, axes = plt.subplots(1, 3, figsize=(16, 5))
+    fig2.suptitle('Policy Comparison: DQN vs Baselines', fontsize=16, fontweight='bold')
 
-    policies = list(results.keys())
-    x = np.arange(len(policies))
-    colors = ['#2ecc71', '#e74c3c', '#3498db', '#9b59b6']
-
-    # Rewards
+    # Rewards with error bars
     rewards = [results[p]['avg_reward'] for p in policies]
-    axes[0].bar(x, rewards, color=colors)
+    reward_stds = [results[p]['std_reward'] for p in policies]
+    bars = axes[0].bar(x, rewards, color=colors, yerr=reward_stds, capsize=5, edgecolor='black', linewidth=0.5)
     axes[0].set_xticks(x)
-    axes[0].set_xticklabels(policies)
+    axes[0].set_xticklabels(policies, fontweight='bold')
     axes[0].set_ylabel('Average Reward')
     axes[0].set_title('Reward (Higher is Better)')
     axes[0].grid(True, alpha=0.3, axis='y')
+    best = np.argmax(rewards)
+    bars[best].set_edgecolor('gold')
+    bars[best].set_linewidth(3)
 
-    # Delays
+    # Delays with error bars
     delays = [results[p]['avg_delay'] * 1000 for p in policies]
-    axes[1].bar(x, delays, color=colors)
+    delay_stds = [results[p]['std_delay'] * 1000 for p in policies]
+    bars = axes[1].bar(x, delays, color=colors, yerr=delay_stds, capsize=5, edgecolor='black', linewidth=0.5)
     axes[1].set_xticks(x)
-    axes[1].set_xticklabels(policies)
+    axes[1].set_xticklabels(policies, fontweight='bold')
     axes[1].set_ylabel('Average Delay (ms)')
     axes[1].set_title('Delay (Lower is Better)')
     axes[1].grid(True, alpha=0.3, axis='y')
+    best = np.argmin(delays)
+    bars[best].set_edgecolor('gold')
+    bars[best].set_linewidth(3)
 
-    # Energy
+    # Energy with error bars
     energies = [results[p]['avg_energy'] * 1000 for p in policies]
-    axes[2].bar(x, energies, color=colors)
+    energy_stds = [results[p]['std_energy'] * 1000 for p in policies]
+    bars = axes[2].bar(x, energies, color=colors, yerr=energy_stds, capsize=5, edgecolor='black', linewidth=0.5)
     axes[2].set_xticks(x)
-    axes[2].set_xticklabels(policies)
+    axes[2].set_xticklabels(policies, fontweight='bold')
     axes[2].set_ylabel('Average Energy (mJ)')
     axes[2].set_title('Energy (Lower is Better)')
     axes[2].grid(True, alpha=0.3, axis='y')
+    best = np.argmin(energies)
+    bars[best].set_edgecolor('gold')
+    bars[best].set_linewidth(3)
 
-    plt.tight_layout()
-    plt.savefig(f"{save_dir}/policy_comparison.png", dpi=150)
-    plt.close()
+    fig2.tight_layout()
+    fig2.savefig(f"{save_dir}/2_policy_comparison.png", dpi=150, bbox_inches='tight')
 
-    # Plot 3: Offload Ratio
-    fig, ax = plt.subplots(figsize=(10, 6))
+    # ── FIGURE 3: Offload Ratio ──────────────────────────────────────────
+    fig3, ax = plt.subplots(figsize=(10, 6))
+    fig3.suptitle('Task Processing Distribution per Policy', fontsize=16, fontweight='bold')
 
     local_ratios = [results[p]['local_ratio'] * 100 for p in policies]
     offload_ratios = [results[p]['offload_ratio'] * 100 for p in policies]
 
-    ax.bar(x, local_ratios, label='Local', color='#3498db')
-    ax.bar(x, offload_ratios, bottom=local_ratios, label='Offload', color='#e74c3c')
+    b1 = ax.bar(x, local_ratios, 0.6, label='Local Processing', color='#3498db', edgecolor='black', linewidth=0.5)
+    b2 = ax.bar(x, offload_ratios, 0.6, bottom=local_ratios, label='Offloaded to UAV', color='#e74c3c', edgecolor='black', linewidth=0.5)
     ax.set_xticks(x)
-    ax.set_xticklabels(policies)
+    ax.set_xticklabels(policies, fontweight='bold')
     ax.set_ylabel('Percentage (%)')
-    ax.set_title('Task Processing Distribution')
-    ax.legend()
-    ax.set_ylim(0, 100)
+    ax.legend(loc='upper right', fontsize=11)
+    ax.set_ylim(0, 110)
+    ax.grid(True, alpha=0.3, axis='y')
 
-    plt.tight_layout()
-    plt.savefig(f"{save_dir}/offload_ratio.png", dpi=150)
-    plt.close()
+    # Add percentage labels inside bars
+    for i in range(len(policies)):
+        if local_ratios[i] > 5:
+            ax.text(x[i], local_ratios[i] / 2, f'{local_ratios[i]:.1f}%',
+                    ha='center', va='center', fontweight='bold', color='white', fontsize=11)
+        if offload_ratios[i] > 5:
+            ax.text(x[i], local_ratios[i] + offload_ratios[i] / 2, f'{offload_ratios[i]:.1f}%',
+                    ha='center', va='center', fontweight='bold', color='white', fontsize=11)
+
+    fig3.tight_layout()
+    fig3.savefig(f"{save_dir}/3_offload_ratio.png", dpi=150, bbox_inches='tight')
+
+    # ── FIGURE 4: Detailed Energy + Delay Comparison ─────────────────────
+    fig4, axes = plt.subplots(1, 2, figsize=(14, 6))
+    fig4.suptitle('DQN Advantage: Energy and Delay Breakdown', fontsize=16, fontweight='bold')
+
+    # Energy comparison with value labels
+    bars = axes[0].bar(x, energies, color=colors, edgecolor='black', linewidth=0.5)
+    axes[0].set_xticks(x)
+    axes[0].set_xticklabels(policies, fontweight='bold')
+    axes[0].set_ylabel('Average Energy (mJ)', fontsize=12)
+    axes[0].set_title('Energy Consumption Comparison')
+    axes[0].grid(True, alpha=0.3, axis='y')
+    for i, (bar, val) in enumerate(zip(bars, energies)):
+        axes[0].text(bar.get_x() + bar.get_width() / 2, bar.get_height() + max(energies) * 0.02,
+                     f'{val:.1f}', ha='center', va='bottom', fontweight='bold', fontsize=10)
+
+    # Delay comparison with value labels
+    bars = axes[1].bar(x, delays, color=colors, edgecolor='black', linewidth=0.5)
+    axes[1].set_xticks(x)
+    axes[1].set_xticklabels(policies, fontweight='bold')
+    axes[1].set_ylabel('Average Delay (ms)', fontsize=12)
+    axes[1].set_title('Delay Comparison')
+    axes[1].grid(True, alpha=0.3, axis='y')
+    for i, (bar, val) in enumerate(zip(bars, delays)):
+        axes[1].text(bar.get_x() + bar.get_width() / 2, bar.get_height() + max(delays) * 0.02,
+                     f'{val:.1f}', ha='center', va='bottom', fontweight='bold', fontsize=10)
+
+    fig4.tight_layout()
+    fig4.savefig(f"{save_dir}/4_energy_delay_detail.png", dpi=150, bbox_inches='tight')
+
+    # ── FIGURE 5: Network Topology ───────────────────────────────────────
+    fig5, ax = plt.subplots(figsize=(10, 10))
+    fig5.suptitle('Network Topology: Devices and UAVs', fontsize=16, fontweight='bold')
+
+    # Plot ground devices
+    dev_x = env.device_positions[:, 0]
+    dev_y = env.device_positions[:, 1]
+    ax.scatter(dev_x, dev_y, c='blue', s=120, marker='s', label='Ground Devices', zorder=3, edgecolors='black')
+    for i, (px, py) in enumerate(zip(dev_x, dev_y)):
+        ax.annotate(f'D{i}', (px, py), textcoords="offset points", xytext=(6, 6), fontsize=8)
+
+    # Plot UAVs
+    uav_x = [p[0] for p in env.uav_positions]
+    uav_y = [p[1] for p in env.uav_positions]
+    ax.scatter(uav_x, uav_y, c='red', s=350, marker='^', label='UAVs', zorder=4, edgecolors='black', linewidths=1.5)
+    for i, pos in enumerate(env.uav_positions):
+        ax.annotate(f'UAV{i}\n(h={pos[2]:.0f}m)', (pos[0], pos[1]),
+                    textcoords="offset points", xytext=(10, 10), fontsize=9, fontweight='bold')
+
+    # Coverage circles
+    for i, pos in enumerate(env.uav_positions):
+        circle = plt.Circle((pos[0], pos[1]), 200, color='red', fill=False,
+                             linestyle='--', alpha=0.3, label='Coverage' if i == 0 else '')
+        ax.add_patch(circle)
+
+    # Draw lines from each device to nearest UAV
+    for d in range(env.num_devices):
+        _, nearest = env._calculate_distance_to_nearest_uav(d)
+        ax.plot([dev_x[d], uav_x[nearest]], [dev_y[d], uav_y[nearest]],
+                'gray', alpha=0.2, linewidth=0.8, linestyle=':')
+
+    ax.set_xlabel('X Position (m)', fontsize=12)
+    ax.set_ylabel('Y Position (m)', fontsize=12)
+    ax.set_title(f'{env.num_devices} Ground Devices + {env.num_uavs} UAVs in {env.area_size}m x {env.area_size}m area')
+    ax.legend(loc='upper right', fontsize=11)
+    ax.set_xlim(-30, env.area_size + 30)
+    ax.set_ylim(-30, env.area_size + 30)
+    ax.set_aspect('equal')
+    ax.grid(True, alpha=0.3)
+
+    fig5.tight_layout()
+    fig5.savefig(f"{save_dir}/5_network_topology.png", dpi=150, bbox_inches='tight')
 
     print(f"\nPlots saved to {save_dir}/")
+    print("Displaying plots...")
+    plt.show()
 
 
 # ==============================================================================
@@ -1118,7 +1220,7 @@ def main():
     results = compare_policies(env, agent, EVAL_EPISODES)
 
     # Generate plots
-    plot_results(history, results)
+    plot_results(history, results, env)
 
     # Final summary
     print("\n" + "=" * 60)
