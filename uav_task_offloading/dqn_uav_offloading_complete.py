@@ -1,1253 +1,516 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-DQN FOR UAV TASK OFFLOADING - COMPLETE IMPLEMENTATION IN ONE FILE
+DQN FOR UAV TASK OFFLOADING - COMPLETE IMPLEMENTATION
 ================================================================================
 
-Author: Educational Implementation for Reinforcement Learning Beginners
-Purpose: Demonstrate DQN for binary task offloading in UAV-assisted edge computing
+Compares Standard DQN vs Dueling DQN for binary task offloading
+in UAV-assisted edge computing networks.
 
 To run: python dqn_uav_offloading_complete.py
 
-Dependencies: pip install numpy matplotlib
+Dependencies: pip install numpy matplotlib torch
 
 ================================================================================
-PROBLEM DESCRIPTION
+KEY FIXES APPLIED:
 ================================================================================
-
-In edge-enabled UAV (Unmanned Aerial Vehicle) networks:
-- Ground devices (IoT sensors, mobile phones) generate computational tasks
-- Each device has LIMITED computing power and battery
-- UAVs fly overhead and offer POWERFUL edge computing services
-
-THE DECISION: For each task, should the device:
-  (A) Process LOCALLY? (slow, uses device battery)
-  (B) OFFLOAD to UAV? (transmission cost, but faster processing)
-
-GOAL: Minimize total DELAY + ENERGY consumption across all tasks
-
-================================================================================
-WHY REINFORCEMENT LEARNING?
-================================================================================
-
-The optimal decision depends on many factors:
-- Task size and complexity
-- Device's remaining energy
-- Distance to nearest UAV
-- Channel quality (wireless signal strength)
-
-Traditional approaches require perfect knowledge and complex optimization.
-RL ADVANTAGE: The agent LEARNS from experience and makes quick decisions!
-
-================================================================================
-DQN (Deep Q-Network) EXPLAINED
-================================================================================
-
-Q-Learning Basics:
-- Q(s, a) = Expected future reward for taking action 'a' in state 's'
-- If we knew Q for all (state, action) pairs, we'd always pick the best action!
-
-The Problem:
-- State space is continuous (infinite states possible)
-- We can't store Q-values in a table
-
-DQN Solution:
-- Use a Neural Network to APPROXIMATE Q-values
-- Input: State (task size, device energy, distance, etc.)
-- Output: Q-values for each action (local, offload)
-
-Key Innovations:
-1. Experience Replay Buffer - stores past experiences, samples randomly
-2. Target Network - separate network for stable learning targets
-3. Epsilon-Greedy - balances exploration vs exploitation
-
+1. CRITICAL: Agent now sees current tasks BEFORE deciding (was blind before)
+2. Double DQN prevents Q-value overestimation
+3. Gradient clipping prevents training divergence
+4. Soft target updates for smoother learning
+5. Larger replay buffer for better sample diversity
+6. Huber loss for robust training
 ================================================================================
 """
 
 import numpy as np
 import random
+import torch
+import torch.nn as nn
+import torch.optim as optim
 from collections import deque
-from dataclasses import dataclass
-from typing import Tuple, List, Dict
-import time
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 import os
 
-# For plotting
-import matplotlib.pyplot as plt
+# =============================================================
+#  SYSTEM PARAMETERS
+# =============================================================
+SLOT_DURATION  = 0.1
+TASK_PROB      = 0.7
+N_DEVICES      = 5
+N_SLOTS        = 300
+N_EPISODES     = 500
+
+F_LOCAL        = 0.5e9      # device CPU: 0.5 GHz
+F_UAV          = 5e9        # UAV CPU:   5 GHz
+B              = 0.5e6      # bandwidth: 0.5 MHz
+N0             = 1e-10
+P_TX           = 0.1
+
+TASK_SIZE_MIN  = 0.1e6      # small tasks -> local clearly faster
+TASK_SIZE_MAX  = 0.5e6
+CYCLES_MIN     = 1e6        # light tasks -> local = 0.002s
+CYCLES_MAX     = 80e6       # heavy tasks -> local = 0.16s -> must offload
+
+UAV_POS = np.array([0, 0, 100])
+DEVICE_POSITIONS = [
+    np.array([50,  50,  0]),
+    np.array([100, 30,  0]),
+    np.array([150, 120, 0]),
+    np.array([80,  150, 0]),
+    np.array([120, 80,  0]),
+]
+
+DROP_PENALTY = 0.15
+
+DISTANCES = [np.linalg.norm(UAV_POS - dp) for dp in DEVICE_POSITIONS]
 
 
-# ==============================================================================
-# PART 1: DATA STRUCTURES
-# ==============================================================================
+# =============================================================
+#  ENVIRONMENT
+# =============================================================
+class UAVEnvironment:
+    def __init__(self):
+        self.state_size  = N_DEVICES * 4 + 1
+        self.action_size = 2 ** N_DEVICES
 
-@dataclass
-class Task:
-    """
-    Represents a computational task generated by a ground device.
+    def reset(self):
+        self.uav_queue_time = 0.0
+        # FIX: Generate tasks FIRST so the agent can see them before deciding
+        self.current_tasks = self._generate_tasks()
+        return self._get_state(self.current_tasks)
 
-    Attributes:
-        data_size: Size of task data in bits (affects transmission time)
-        cpu_cycles: Required CPU cycles to complete (affects processing time)
-        device_id: Which device generated this task
-    """
-    data_size: float      # in bits
-    cpu_cycles: float     # in cycles
-    device_id: int
+    def _generate_tasks(self):
+        tasks = []
+        for _ in range(N_DEVICES):
+            if random.random() < TASK_PROB:
+                D = random.uniform(TASK_SIZE_MIN, TASK_SIZE_MAX)
+                C = random.uniform(CYCLES_MIN, CYCLES_MAX)
+                tasks.append((D, C))
+            else:
+                tasks.append(None)
+        return tasks
+
+    def _get_state(self, tasks=None):
+        state = []
+        for i in range(N_DEVICES):
+            if tasks and tasks[i] is not None:
+                D, C = tasks[i]
+                state.append(D / TASK_SIZE_MAX)
+                state.append(C / CYCLES_MAX)
+                state.append(DISTANCES[i] / 250)
+                state.append(1.0)
+            else:
+                state.append(0.0)
+                state.append(0.0)
+                state.append(DISTANCES[i] / 250)
+                state.append(0.0)
+        state.append(min(self.uav_queue_time / SLOT_DURATION, 1.0))
+        return np.array(state, dtype=np.float32)
+
+    def step(self, action):
+        # FIX: Use the tasks the agent already saw in its state
+        tasks     = self.current_tasks
+        decisions = [(action >> i) & 1 for i in range(N_DEVICES)]
+        total_latency = 0.0
+        info = []
+
+        for i in range(N_DEVICES):
+            if tasks[i] is None:
+                info.append({"device": i, "action": "no task",
+                             "latency": 0, "dropped": False})
+                continue
+
+            D, C = tasks[i]
+
+            if decisions[i] == 0:
+                latency = C / F_LOCAL
+                dropped = latency > SLOT_DURATION
+                if dropped:
+                    latency = DROP_PENALTY
+                info.append({"device": i, "action": "local",
+                             "latency": latency, "dropped": dropped})
+            else:
+                SNR      = P_TX / (N0 * DISTANCES[i] ** 2)
+                R        = B * np.log2(1 + SNR)
+                t_upload = D / R
+                t_wait   = max(0.0, self.uav_queue_time)
+                t_exec   = C / F_UAV
+                latency  = t_upload + t_wait + t_exec
+                self.uav_queue_time += t_exec
+                dropped  = latency > SLOT_DURATION
+                if dropped:
+                    latency = DROP_PENALTY
+                info.append({"device": i, "action": "offload",
+                             "latency": latency, "dropped": dropped})
+
+            total_latency += latency
+
+        self.uav_queue_time = max(0.0, self.uav_queue_time - SLOT_DURATION)
+
+        # FIX: Generate NEXT step's tasks for the next state
+        self.current_tasks = self._generate_tasks()
+        next_state = self._get_state(self.current_tasks)
+
+        reward = -total_latency
+        return next_state, reward, total_latency, info, tasks, decisions
 
 
-@dataclass
-class GroundDevice:
-    """
-    Represents an IoT/ground device with limited computing capacity.
-
-    Real-world examples: smartphones, sensors, wearables, drones
-
-    Attributes:
-        cpu_frequency: Processing speed in Hz (cycles per second)
-        transmit_power: Power for wireless transmission in Watts
-        energy_coefficient: Energy consumption coefficient for local computing
-    """
-    cpu_frequency: float = 1e9      # 1 GHz (typical IoT device)
-    transmit_power: float = 1.0     # 1.0 Watts (higher transmission cost!)
-    energy_coefficient: float = 1e-29  # Lower coefficient = cheaper local processing
-
-
-@dataclass
-class UAV:
-    """
-    Represents a UAV with edge computing capability.
-
-    UAVs act as flying edge servers, providing computation services to ground devices.
-
-    Attributes:
-        cpu_frequency: Processing speed (much higher than ground devices)
-        position: (x, y, altitude) coordinates
-        bandwidth: Available bandwidth for communication in Hz
-    """
-    cpu_frequency: float = 10e9     # 10 GHz (powerful edge server)
-    position: Tuple[float, float, float] = (0, 0, 100)  # x, y, altitude(m)
-    bandwidth: float = 10e6         # 10 MHz bandwidth
-
-
-# ==============================================================================
-# PART 2: ENVIRONMENT
-# ==============================================================================
-
-class UAVOffloadingEnv:
-    """
-    Reinforcement Learning Environment for UAV Task Offloading.
-
-    This environment simulates a network where:
-    - Ground devices generate computational tasks
-    - Each device decides: process locally OR offload to UAV
-    - Goal: minimize delay and energy consumption
-
-    STATE SPACE (5 features):
-    -------------------------
-    1. Task data size (normalized to [0,1])
-    2. Task CPU cycles (normalized to [0,1])
-    3. Device's current energy level (normalized)
-    4. Distance to nearest UAV (normalized)
-    5. Channel quality indicator (normalized)
-
-    ACTION SPACE (binary):
-    ----------------------
-    - 0: Process locally
-    - 1: Offload to nearest UAV
-
-    REWARD:
-    -------
-    Reward = -(delay_weight * delay + energy_weight * energy)
-
-    We want to MINIMIZE delay and energy, so reward is negative cost.
-    Higher reward (closer to 0) means better performance!
-    """
-
-    def __init__(
-        self,
-        num_devices: int = 10,
-        num_uavs: int = 3,
-        area_size: float = 500.0,
-        episode_length: int = 100,
-        delay_weight: float = 0.5,
-        energy_weight: float = 0.5
-    ):
-        """
-        Initialize the UAV offloading environment.
-
-        Args:
-            num_devices: Number of ground IoT devices (default: 10)
-            num_uavs: Number of UAVs providing edge computing (default: 3)
-            area_size: Size of simulation area in meters (default: 500x500m)
-            episode_length: Number of tasks per episode (default: 100)
-            delay_weight: Weight for delay in reward function (0-1)
-            energy_weight: Weight for energy in reward function (0-1)
-        """
-        self.num_devices = num_devices
-        self.num_uavs = num_uavs
-        self.area_size = area_size
-        self.episode_length = episode_length
-        self.delay_weight = delay_weight
-        self.energy_weight = energy_weight
-
-        # State and action dimensions
-        self.state_dim = 5   # 5 features per state
-        self.action_dim = 2  # Binary: 0=local, 1=offload
-
-        # Channel parameters for wireless communication
-        self.noise_power = 1e-10          # Noise power in Watts
-        self.path_loss_exponent = 2.5     # Signal attenuation factor
-
-        # Task generation parameters
-        # Varied sizes create scenarios where both strategies can be optimal
-        self.min_data_size = 50e3     # 50 KB minimum
-        self.max_data_size = 1000e3   # 1 MB maximum
-        self.min_cpu_cycles = 50e6    # 50 Mega cycles
-        self.max_cpu_cycles = 1000e6  # 1000 Mega cycles
-
-        # Initialize network topology
-        self._setup_network()
-
-        # Episode tracking
-        self.current_step = 0
-        self.current_task = None
-
-    def _setup_network(self):
-        """Set up the network topology with devices and UAVs."""
-        # Create ground devices with varying capabilities
-        # Key: Some devices have efficient local processing (low freq, low energy)
-        #      Transmission is costly (high power), so small tasks favor local
-        self.devices = []
-        for i in range(self.num_devices):
-            device = GroundDevice(
-                cpu_frequency=np.random.uniform(1e9, 2e9),    # 1-2 GHz (energy efficient)
-                transmit_power=np.random.uniform(1.0, 2.0),   # 1-2 W (high transmission cost!)
-                energy_coefficient=np.random.uniform(5e-30, 2e-29),  # Low = efficient local
-            )
-            self.devices.append(device)
-
-        # Random positions for devices (x, y coordinates)
-        self.device_positions = np.random.uniform(
-            0, self.area_size, size=(self.num_devices, 2)
+# =============================================================
+#  STANDARD DQN NETWORK
+# =============================================================
+class DQNNet(nn.Module):
+    def __init__(self, state_size, action_size):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_size, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, action_size)
         )
-
-        # Create UAVs positioned across the area
-        self.uavs = []
-        self.uav_positions = []
-        for i in range(self.num_uavs):
-            uav = UAV(
-                cpu_frequency=np.random.uniform(5e9, 8e9),   # 5-8 GHz
-                bandwidth=np.random.uniform(5e6, 10e6),      # 5-10 MHz
-            )
-            self.uavs.append(uav)
-
-            # Distribute UAVs across the area
-            x = self.area_size * (i + 0.5) / self.num_uavs
-            y = self.area_size / 2 + np.random.uniform(-100, 100)
-            altitude = np.random.uniform(100, 150)  # 100-150m altitude
-            self.uav_positions.append((x, y, altitude))
-
-        # Device energy levels (reset each episode)
-        self.device_energy = np.ones(self.num_devices) * 100  # 100 Joules
-
-    def _generate_task(self) -> Task:
-        """Generate a random computational task from a random device."""
-        device_id = np.random.randint(0, self.num_devices)
-        task = Task(
-            data_size=np.random.uniform(self.min_data_size, self.max_data_size),
-            cpu_cycles=np.random.uniform(self.min_cpu_cycles, self.max_cpu_cycles),
-            device_id=device_id
-        )
-        return task
-
-    def _calculate_distance_to_nearest_uav(self, device_id: int) -> Tuple[float, int]:
-        """Calculate distance from device to nearest UAV."""
-        device_pos = self.device_positions[device_id]
-        min_distance = float('inf')
-        nearest_uav = 0
-
-        for i, uav_pos in enumerate(self.uav_positions):
-            # 3D Euclidean distance
-            dx = device_pos[0] - uav_pos[0]
-            dy = device_pos[1] - uav_pos[1]
-            dz = 0 - uav_pos[2]  # Device at ground level
-            distance = np.sqrt(dx**2 + dy**2 + dz**2)
-
-            if distance < min_distance:
-                min_distance = distance
-                nearest_uav = i
-
-        return min_distance, nearest_uav
-
-    def _calculate_channel_gain(self, distance: float) -> float:
-        """
-        Calculate wireless channel gain based on distance.
-        Uses free-space path loss model: gain decreases with distance.
-        """
-        distance = max(distance, 1.0)  # Avoid division by zero
-        channel_gain = 1e-4 * (distance ** (-self.path_loss_exponent))
-        return channel_gain
-
-    def _calculate_transmission_rate(self, device_id: int, uav_id: int) -> float:
-        """
-        Calculate achievable transmission rate using Shannon's formula.
-
-        Rate = Bandwidth * log2(1 + SNR)
-        where SNR = (transmit_power * channel_gain) / noise_power
-        """
-        distance, _ = self._calculate_distance_to_nearest_uav(device_id)
-        channel_gain = self._calculate_channel_gain(distance)
-
-        device = self.devices[device_id]
-        uav = self.uavs[uav_id]
-
-        # Signal-to-Noise Ratio
-        snr = (device.transmit_power * channel_gain) / self.noise_power
-
-        # Shannon capacity formula
-        rate = uav.bandwidth * np.log2(1 + snr)
-        return rate
-
-    def _compute_local_cost(self, task: Task) -> Tuple[float, float]:
-        """
-        Compute delay and energy for LOCAL processing.
-
-        Delay = CPU_cycles / CPU_frequency
-        Energy = energy_coefficient * CPU_cycles * CPU_frequency^2
-
-        Returns:
-            Tuple of (delay in seconds, energy in Joules)
-        """
-        device = self.devices[task.device_id]
-
-        # Local processing delay
-        delay = task.cpu_cycles / device.cpu_frequency
-
-        # Local energy consumption (dynamic power model)
-        energy = device.energy_coefficient * task.cpu_cycles * (device.cpu_frequency ** 2)
-
-        return delay, energy
-
-    def _compute_offload_cost(self, task: Task) -> Tuple[float, float]:
-        """
-        Compute delay and energy for OFFLOADING to UAV.
-
-        Delay = transmission_delay + UAV_processing_delay
-        Energy = transmit_power * transmission_time
-
-        Returns:
-            Tuple of (delay in seconds, energy in Joules)
-        """
-        device = self.devices[task.device_id]
-        distance, nearest_uav = self._calculate_distance_to_nearest_uav(task.device_id)
-        uav = self.uavs[nearest_uav]
-
-        # Transmission rate (bits per second)
-        rate = self._calculate_transmission_rate(task.device_id, nearest_uav)
-
-        # Transmission delay
-        transmission_delay = task.data_size / rate
-
-        # UAV processing delay
-        uav_processing_delay = task.cpu_cycles / uav.cpu_frequency
-
-        # Total delay
-        total_delay = transmission_delay + uav_processing_delay
-
-        # Energy consumed by device (only transmission)
-        energy = device.transmit_power * transmission_delay
-
-        return total_delay, energy
-
-    def _get_state(self) -> np.ndarray:
-        """
-        Get the current state observation.
-
-        State features (all normalized to [0,1] for neural network):
-        1. Task data size
-        2. Task CPU cycles
-        3. Device energy level
-        4. Distance to nearest UAV
-        5. Channel quality indicator
-        """
-        task = self.current_task
-        device_id = task.device_id
-
-        # Normalize features to [0, 1] range
-        data_size_norm = (task.data_size - self.min_data_size) / (self.max_data_size - self.min_data_size)
-        cpu_cycles_norm = (task.cpu_cycles - self.min_cpu_cycles) / (self.max_cpu_cycles - self.min_cpu_cycles)
-        energy_norm = self.device_energy[device_id] / 100.0
-
-        distance, _ = self._calculate_distance_to_nearest_uav(device_id)
-        max_distance = np.sqrt(2) * self.area_size + 150
-        distance_norm = distance / max_distance
-
-        channel_gain = self._calculate_channel_gain(distance)
-        channel_norm = min(channel_gain / 1e-4, 1.0)
-
-        state = np.array([
-            data_size_norm,
-            cpu_cycles_norm,
-            energy_norm,
-            distance_norm,
-            channel_norm
-        ], dtype=np.float32)
-
-        return state
-
-    def reset(self) -> np.ndarray:
-        """Reset the environment for a new episode."""
-        self.device_energy = np.ones(self.num_devices) * 100
-        self.current_step = 0
-        self.current_task = self._generate_task()
-        return self._get_state()
-
-    def step(self, action: int) -> Tuple[np.ndarray, float, bool, dict]:
-        """
-        Execute one step in the environment.
-
-        Args:
-            action: 0 for local processing, 1 for offloading
-
-        Returns:
-            Tuple of (next_state, reward, done, info)
-        """
-        task = self.current_task
-        device_id = task.device_id
-
-        # Calculate costs based on action
-        if action == 0:  # Local processing
-            delay, energy = self._compute_local_cost(task)
-            decision = "local"
-        else:  # Offload to UAV
-            delay, energy = self._compute_offload_cost(task)
-            decision = "offload"
-
-        # Update device energy
-        self.device_energy[device_id] = max(0, self.device_energy[device_id] - energy)
-
-        # Calculate reward (negative cost)
-        delay_normalized = delay / 1.0
-        energy_normalized = energy / 1.0
-        reward = -(self.delay_weight * delay_normalized + self.energy_weight * energy_normalized)
-
-        # Penalty for running out of energy
-        if self.device_energy[device_id] <= 0:
-            reward -= 10.0
-
-        # Move to next step
-        self.current_step += 1
-        done = self.current_step >= self.episode_length
-
-        # Generate next task
-        if not done:
-            self.current_task = self._generate_task()
-            next_state = self._get_state()
-        else:
-            next_state = np.zeros(self.state_dim, dtype=np.float32)
-
-        info = {
-            'delay': delay,
-            'energy': energy,
-            'decision': decision,
-            'device_id': device_id
-        }
-
-        return next_state, reward, done, info
-
-
-# ==============================================================================
-# PART 3: REPLAY BUFFER
-# ==============================================================================
-
-class ReplayBuffer:
-    """
-    Experience Replay Buffer for DQN.
-
-    WHY USE REPLAY BUFFER?
-    ----------------------
-    1. Breaks correlation between consecutive experiences
-    2. Allows reuse of past experiences multiple times
-    3. Improves sample efficiency and training stability
-
-    Each experience is a tuple: (state, action, reward, next_state, done)
-    """
-
-    def __init__(self, capacity: int = 10000):
-        self.buffer = deque(maxlen=capacity)
-
-    def push(self, state, action, reward, next_state, done):
-        """Add an experience to the buffer."""
-        self.buffer.append((state, action, reward, next_state, done))
-
-    def sample(self, batch_size: int):
-        """Randomly sample a batch of experiences."""
-        batch = random.sample(self.buffer, batch_size)
-
-        states = np.array([exp[0] for exp in batch])
-        actions = np.array([exp[1] for exp in batch])
-        rewards = np.array([exp[2] for exp in batch])
-        next_states = np.array([exp[3] for exp in batch])
-        dones = np.array([exp[4] for exp in batch])
-
-        return states, actions, rewards, next_states, dones
-
-    def __len__(self):
-        return len(self.buffer)
-
-
-# ==============================================================================
-# PART 4: NEURAL NETWORK (FROM SCRATCH!)
-# ==============================================================================
-
-class NeuralNetwork:
-    """
-    Simple Neural Network implemented from scratch.
-
-    No PyTorch or TensorFlow needed! This is for educational purposes.
-
-    Architecture: Input → Hidden1(ReLU) → Hidden2(ReLU) → Output(Linear)
-
-    For production use, you'd want to use PyTorch/TensorFlow for:
-    - GPU acceleration
-    - Automatic differentiation
-    - More optimizers
-    """
-
-    def __init__(self, input_dim: int, hidden_dims: List[int], output_dim: int,
-                 learning_rate: float = 0.001):
-        self.learning_rate = learning_rate
-        self.layers = []
-        self.biases = []
-
-        # Build layers with Xavier initialization
-        dims = [input_dim] + hidden_dims + [output_dim]
-        for i in range(len(dims) - 1):
-            scale = np.sqrt(2.0 / dims[i])  # Xavier init
-            W = np.random.randn(dims[i], dims[i+1]) * scale
-            b = np.zeros((1, dims[i+1]))
-            self.layers.append(W)
-            self.biases.append(b)
-
-    def relu(self, x):
-        """ReLU activation: max(0, x)"""
-        return np.maximum(0, x)
-
-    def relu_derivative(self, x):
-        """Derivative of ReLU"""
-        return (x > 0).astype(float)
 
     def forward(self, x):
-        """Forward pass through the network."""
-        activations = [x]
-
-        for i, (W, b) in enumerate(zip(self.layers, self.biases)):
-            x = np.dot(x, W) + b
-            if i < len(self.layers) - 1:  # ReLU for hidden layers
-                x = self.relu(x)
-            activations.append(x)
-
-        return x, activations
-
-    def predict(self, x):
-        """Get Q-values for given states."""
-        output, _ = self.forward(x)
-        return output
-
-    def train_step(self, states, actions, targets):
-        """Perform one training step with backpropagation."""
-        batch_size = states.shape[0]
-
-        # Forward pass
-        output, activations = self.forward(states)
-
-        # Calculate loss (MSE for taken actions only)
-        target_q = output.copy()
-        loss = 0.0
-        for i in range(batch_size):
-            target_q[i, actions[i]] = targets[i]
-            loss += (output[i, actions[i]] - targets[i]) ** 2
-        loss /= batch_size
-
-        # Backward pass
-        dL_dout = 2 * (output - target_q) / batch_size
-        delta = dL_dout
-
-        gradients_W = []
-        gradients_b = []
-
-        for i in range(len(self.layers) - 1, -1, -1):
-            dW = np.dot(activations[i].T, delta)
-            db = np.sum(delta, axis=0, keepdims=True)
-            gradients_W.insert(0, dW)
-            gradients_b.insert(0, db)
-
-            if i > 0:
-                delta = np.dot(delta, self.layers[i].T)
-                delta = delta * self.relu_derivative(activations[i])
-
-        # Update weights (gradient descent)
-        for i in range(len(self.layers)):
-            self.layers[i] -= self.learning_rate * gradients_W[i]
-            self.biases[i] -= self.learning_rate * gradients_b[i]
-
-        return loss
-
-    def copy_weights_from(self, other):
-        """Copy weights from another network."""
-        for i in range(len(self.layers)):
-            self.layers[i] = other.layers[i].copy()
-            self.biases[i] = other.biases[i].copy()
+        return self.net(x)
 
 
-# ==============================================================================
-# PART 5: DQN AGENT
-# ==============================================================================
+# =============================================================
+#  DUELING DQN NETWORK
+# =============================================================
+class DuelingDQNNet(nn.Module):
+    """
+    Splits into two streams:
+      Value stream     -> V(s)    how good is this state
+      Advantage stream -> A(s,a)  how much better is each action
+    Q(s,a) = V(s) + A(s,a) - mean(A(s,a))
+    """
+    def __init__(self, state_size, action_size):
+        super().__init__()
 
+        # Shared layers
+        self.feature = nn.Sequential(
+            nn.Linear(state_size, 256),
+            nn.ReLU()
+        )
+
+        # Value stream
+        self.value_stream = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1)
+        )
+
+        # Advantage stream
+        self.advantage_stream = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, action_size)
+        )
+
+    def forward(self, x):
+        features  = self.feature(x)
+        value     = self.value_stream(features)
+        advantage = self.advantage_stream(features)
+        return value + (advantage - advantage.mean(dim=1, keepdim=True))
+
+
+# =============================================================
+#  GENERIC AGENT (with Double DQN + improvements)
+# =============================================================
 class DQNAgent:
-    """
-    Deep Q-Network Agent for Task Offloading.
-
-    The agent learns to make binary offloading decisions:
-    - Action 0: Process task locally
-    - Action 1: Offload task to UAV
-
-    KEY COMPONENTS:
-    ---------------
-    1. Q-Network: Neural network that predicts Q-values
-    2. Target Network: Stable copy for computing targets
-    3. Replay Buffer: Stores experiences for training
-    4. Epsilon-Greedy: Exploration strategy
-    """
-
-    def __init__(
-        self,
-        state_dim: int,
-        action_dim: int = 2,
-        hidden_dims: List[int] = [64, 64],
-        learning_rate: float = 0.001,
-        gamma: float = 0.99,
-        epsilon_start: float = 1.0,
-        epsilon_end: float = 0.01,
-        epsilon_decay: float = 0.995,
-        buffer_size: int = 10000,
-        batch_size: int = 64,
-        target_update_freq: int = 10
-    ):
-        """
-        Initialize the DQN agent.
-
-        Args:
-            state_dim: Size of state space (5 for our environment)
-            action_dim: Number of actions (2: local or offload)
-            hidden_dims: Sizes of hidden layers
-            learning_rate: How fast to update weights
-            gamma: Discount factor for future rewards (0.99 = value future)
-            epsilon_start: Initial exploration rate (1.0 = 100% random)
-            epsilon_end: Final exploration rate (0.01 = 1% random)
-            epsilon_decay: How fast epsilon decreases each episode
-            buffer_size: Replay buffer capacity
-            batch_size: Samples per training step
-            target_update_freq: Episodes between target network updates
-        """
-        self.state_dim = state_dim
-        self.action_dim = action_dim
-        self.gamma = gamma
-        self.batch_size = batch_size
-        self.target_update_freq = target_update_freq
-
-        # Epsilon for exploration
-        self.epsilon = epsilon_start
-        self.epsilon_end = epsilon_end
-        self.epsilon_decay = epsilon_decay
-
-        # Q-Network (gets updated every step)
-        self.q_network = NeuralNetwork(state_dim, hidden_dims, action_dim, learning_rate)
-
-        # Target Network (updated less frequently for stability)
-        self.target_network = NeuralNetwork(state_dim, hidden_dims, action_dim, learning_rate)
-        self.target_network.copy_weights_from(self.q_network)
-
-        # Experience replay
-        self.replay_buffer = ReplayBuffer(buffer_size)
-
-        self.episode_count = 0
-
-    def select_action(self, state: np.ndarray, training: bool = True) -> int:
-        """
-        Select action using epsilon-greedy policy.
-
-        EPSILON-GREEDY:
-        - With probability epsilon: random action (EXPLORE)
-        - With probability 1-epsilon: best action (EXPLOIT)
-
-        During training, we start with high exploration and gradually exploit more.
-        """
-        if training and random.random() < self.epsilon:
-            return random.randint(0, self.action_dim - 1)
-        else:
-            state = state.reshape(1, -1)
-            q_values = self.q_network.predict(state)
-            return np.argmax(q_values[0])
-
-    def store_experience(self, state, action, reward, next_state, done):
-        """Store experience in replay buffer."""
-        self.replay_buffer.push(state, action, reward, next_state, done)
-
-    def train(self) -> float:
-        """
-        Train the agent using experiences from replay buffer.
-
-        DQN UPDATE RULE:
-        ----------------
-        For each experience (s, a, r, s', done):
-
-        if done:
-            target = r
-        else:
-            target = r + gamma * max_a' Q_target(s', a')
-
-        Then minimize: (Q(s, a) - target)^2
-        """
-        if len(self.replay_buffer) < self.batch_size:
-            return 0.0
-
-        # Sample batch
-        states, actions, rewards, next_states, dones = self.replay_buffer.sample(self.batch_size)
-
-        # Compute targets using target network
-        next_q_values = self.target_network.predict(next_states)
-        max_next_q = np.max(next_q_values, axis=1)
-        targets = rewards + (1 - dones) * self.gamma * max_next_q
-
-        # Update Q-network
-        loss = self.q_network.train_step(states, actions, targets)
-
-        return loss
-
-    def decay_epsilon(self):
-        """Decay exploration rate after each episode."""
-        self.epsilon = max(self.epsilon_end, self.epsilon * self.epsilon_decay)
-        self.episode_count += 1
-
-        # Update target network periodically
-        if self.episode_count % self.target_update_freq == 0:
-            self.target_network.copy_weights_from(self.q_network)
-
-
-# ==============================================================================
-# PART 6: BASELINE POLICIES
-# ==============================================================================
-
-class AllLocalBaseline:
-    """Always processes tasks locally (never offloads)."""
-    def select_action(self, state, training=True):
-        return 0
-
-
-class AllOffloadBaseline:
-    """Always offloads tasks to UAV (never processes locally)."""
-    def select_action(self, state, training=True):
-        return 1
-
-
-class RandomBaseline:
-    """Randomly chooses between local and offload."""
-    def select_action(self, state, training=True):
-        return random.randint(0, 1)
-
-
-# ==============================================================================
-# PART 7: TRAINING FUNCTIONS
-# ==============================================================================
-
-def train_dqn(env, agent, num_episodes=500, print_every=50):
-    """
-    Train the DQN agent.
-
-    Args:
-        env: The UAV offloading environment
-        agent: The DQN agent
-        num_episodes: Number of training episodes
-        print_every: Print progress every N episodes
-
-    Returns:
-        Training history dictionary
-    """
-    history = {
-        'episode_rewards': [],
-        'episode_delays': [],
-        'episode_energies': [],
-        'losses': [],
-        'epsilons': []
-    }
-
-    print("=" * 60)
-    print("TRAINING DQN AGENT")
-    print("=" * 60)
-    print(f"Episodes: {num_episodes}")
-    print(f"State dim: {env.state_dim}, Action dim: {env.action_dim}")
-    print("=" * 60)
-
-    for episode in range(num_episodes):
-        state = env.reset()
-        episode_reward = 0
-        episode_delay = 0
-        episode_energy = 0
-        episode_losses = []
-
-        done = False
-        while not done:
-            # Select and execute action
-            action = agent.select_action(state, training=True)
-            next_state, reward, done, info = env.step(action)
-
-            # Store and train
-            agent.store_experience(state, action, reward, next_state, done)
-            loss = agent.train()
-            if loss > 0:
-                episode_losses.append(loss)
-
-            # Track metrics
-            episode_reward += reward
-            episode_delay += info['delay']
-            episode_energy += info['energy']
-
-            state = next_state
-
-        # End of episode
-        agent.decay_epsilon()
-
-        # Store history
-        history['episode_rewards'].append(episode_reward)
-        history['episode_delays'].append(episode_delay)
-        history['episode_energies'].append(episode_energy)
-        history['losses'].append(np.mean(episode_losses) if episode_losses else 0)
-        history['epsilons'].append(agent.epsilon)
-
-        # Print progress
-        if (episode + 1) % print_every == 0:
-            avg_reward = np.mean(history['episode_rewards'][-print_every:])
-            avg_delay = np.mean(history['episode_delays'][-print_every:])
-            print(f"Episode {episode+1}/{num_episodes} | "
-                  f"Avg Reward: {avg_reward:.2f} | "
-                  f"Avg Delay: {avg_delay*1000:.1f}ms | "
-                  f"Epsilon: {agent.epsilon:.3f}")
-
-    return history
-
-
-def evaluate_policy(env, policy, num_episodes=100):
-    """Evaluate a policy over multiple episodes."""
-    total_rewards = []
-    total_delays = []
-    total_energies = []
-    local_count = 0
-    offload_count = 0
-
-    for _ in range(num_episodes):
-        state = env.reset()
-        episode_reward = 0
-        episode_delay = 0
-        episode_energy = 0
-
-        done = False
-        while not done:
-            action = policy.select_action(state, training=False)
-            next_state, reward, done, info = env.step(action)
-
-            episode_reward += reward
-            episode_delay += info['delay']
-            episode_energy += info['energy']
-
-            if action == 0:
-                local_count += 1
-            else:
-                offload_count += 1
-
-            state = next_state
-
-        total_rewards.append(episode_reward)
-        total_delays.append(episode_delay)
-        total_energies.append(episode_energy)
-
-    return {
-        'avg_reward': np.mean(total_rewards),
-        'std_reward': np.std(total_rewards),
-        'avg_delay': np.mean(total_delays),
-        'std_delay': np.std(total_delays),
-        'avg_energy': np.mean(total_energies),
-        'std_energy': np.std(total_energies),
-        'local_ratio': local_count / (local_count + offload_count),
-        'offload_ratio': offload_count / (local_count + offload_count)
-    }
-
-
-def compare_policies(env, dqn_agent, num_episodes=100):
-    """Compare DQN with baseline policies."""
-    print("\n" + "=" * 60)
-    print("COMPARING POLICIES")
-    print("=" * 60)
-
-    policies = {
-        'DQN': dqn_agent,
-        'All Local': AllLocalBaseline(),
-        'All Offload': AllOffloadBaseline(),
-        'Random': RandomBaseline()
-    }
-
-    results = {}
-    for name, policy in policies.items():
-        print(f"Evaluating {name}...")
-        results[name] = evaluate_policy(env, policy, num_episodes)
-
-    # Print comparison table
-    print("\n" + "=" * 80)
-    print(f"{'Policy':<15} {'Avg Reward':<15} {'Avg Delay (ms)':<18} {'Avg Energy (mJ)':<18} {'Local %':<10}")
-    print("-" * 80)
-
-    for name, res in results.items():
-        print(f"{name:<15} {res['avg_reward']:<15.2f} {res['avg_delay']*1000:<18.2f} "
-              f"{res['avg_energy']*1000:<18.2f} {res['local_ratio']*100:<10.1f}")
-
-    print("=" * 80)
-
-    # Print improvements
-    print("\nDQN IMPROVEMENT OVER BASELINES:")
-    dqn_reward = results['DQN']['avg_reward']
-    for name in ['All Local', 'All Offload', 'Random']:
-        baseline_reward = results[name]['avg_reward']
-        improvement = ((dqn_reward - baseline_reward) / abs(baseline_reward)) * 100
-        print(f"  vs {name}: {improvement:+.1f}%")
-
-    return results
-
-
-# ==============================================================================
-# PART 8: VISUALIZATION
-# ==============================================================================
-
-def smooth(data, window=20):
-    """Smooth data using moving average for cleaner plots."""
-    smoothed = []
-    for i in range(len(data)):
-        start = max(0, i - window // 2)
-        end = min(len(data), i + window // 2)
-        smoothed.append(np.mean(data[start:end]))
-    return smoothed
-
-
-def plot_results(history, results, env, save_dir="./results"):
-    """
-    Generate all plots: saves to files AND displays on screen.
-
-    Creates 5 figures:
-    1. Training history (reward, delay, loss, epsilon)
-    2. Policy comparison bars (reward, delay, energy)
-    3. Offload ratio stacked bars
-    4. Energy comparison detail
-    5. Network topology map
-    """
-    os.makedirs(save_dir, exist_ok=True)
-    episodes = range(1, len(history['episode_rewards']) + 1)
-    policies = list(results.keys())
-    x = np.arange(len(policies))
-    colors = ['#2ecc71', '#e74c3c', '#3498db', '#9b59b6']
-
-    # ── FIGURE 1: Training History ───────────────────────────────────────
-    fig1, axes = plt.subplots(2, 2, figsize=(14, 10))
-    fig1.suptitle('DQN Training Progress', fontsize=16, fontweight='bold')
-
-    # Rewards
-    axes[0, 0].plot(episodes, history['episode_rewards'], alpha=0.3, color='blue')
-    axes[0, 0].plot(episodes, smooth(history['episode_rewards']), color='blue', linewidth=2)
-    axes[0, 0].set_xlabel('Episode')
-    axes[0, 0].set_ylabel('Reward')
-    axes[0, 0].set_title('Episode Rewards (Higher is Better)')
-    axes[0, 0].grid(True, alpha=0.3)
-
-    # Delays
-    delays_ms = [d * 1000 for d in history['episode_delays']]
-    axes[0, 1].plot(episodes, delays_ms, alpha=0.3, color='red')
-    axes[0, 1].plot(episodes, smooth(delays_ms), color='red', linewidth=2)
-    axes[0, 1].set_xlabel('Episode')
-    axes[0, 1].set_ylabel('Delay (ms)')
-    axes[0, 1].set_title('Episode Delays (Lower is Better)')
-    axes[0, 1].grid(True, alpha=0.3)
-
-    # Energy over training
-    energies_mj = [e * 1000 for e in history['episode_energies']]
-    axes[1, 0].plot(episodes, energies_mj, alpha=0.3, color='orange')
-    axes[1, 0].plot(episodes, smooth(energies_mj), color='orange', linewidth=2)
-    axes[1, 0].set_xlabel('Episode')
-    axes[1, 0].set_ylabel('Energy (mJ)')
-    axes[1, 0].set_title('Episode Energy (Lower is Better)')
-    axes[1, 0].grid(True, alpha=0.3)
-
-    # Epsilon decay
-    axes[1, 1].plot(episodes, history['epsilons'], color='purple', linewidth=2)
-    axes[1, 1].set_xlabel('Episode')
-    axes[1, 1].set_ylabel('Epsilon')
-    axes[1, 1].set_title('Exploration Rate Decay')
-    axes[1, 1].axhline(y=0.01, color='gray', linestyle='--', alpha=0.5, label='Min epsilon')
-    axes[1, 1].legend()
-    axes[1, 1].grid(True, alpha=0.3)
-
-    fig1.tight_layout()
-    fig1.savefig(f"{save_dir}/1_training_history.png", dpi=150, bbox_inches='tight')
-
-    # ── FIGURE 2: Policy Comparison Bars ─────────────────────────────────
-    fig2, axes = plt.subplots(1, 3, figsize=(16, 5))
-    fig2.suptitle('Policy Comparison: DQN vs Baselines', fontsize=16, fontweight='bold')
-
-    # Rewards with error bars
-    rewards = [results[p]['avg_reward'] for p in policies]
-    reward_stds = [results[p]['std_reward'] for p in policies]
-    bars = axes[0].bar(x, rewards, color=colors, yerr=reward_stds, capsize=5, edgecolor='black', linewidth=0.5)
-    axes[0].set_xticks(x)
-    axes[0].set_xticklabels(policies, fontweight='bold')
-    axes[0].set_ylabel('Average Reward')
-    axes[0].set_title('Reward (Higher is Better)')
-    axes[0].grid(True, alpha=0.3, axis='y')
-    best = np.argmax(rewards)
-    bars[best].set_edgecolor('gold')
-    bars[best].set_linewidth(3)
-
-    # Delays with error bars
-    delays = [results[p]['avg_delay'] * 1000 for p in policies]
-    delay_stds = [results[p]['std_delay'] * 1000 for p in policies]
-    bars = axes[1].bar(x, delays, color=colors, yerr=delay_stds, capsize=5, edgecolor='black', linewidth=0.5)
-    axes[1].set_xticks(x)
-    axes[1].set_xticklabels(policies, fontweight='bold')
-    axes[1].set_ylabel('Average Delay (ms)')
-    axes[1].set_title('Delay (Lower is Better)')
-    axes[1].grid(True, alpha=0.3, axis='y')
-    best = np.argmin(delays)
-    bars[best].set_edgecolor('gold')
-    bars[best].set_linewidth(3)
-
-    # Energy with error bars
-    energies = [results[p]['avg_energy'] * 1000 for p in policies]
-    energy_stds = [results[p]['std_energy'] * 1000 for p in policies]
-    bars = axes[2].bar(x, energies, color=colors, yerr=energy_stds, capsize=5, edgecolor='black', linewidth=0.5)
-    axes[2].set_xticks(x)
-    axes[2].set_xticklabels(policies, fontweight='bold')
-    axes[2].set_ylabel('Average Energy (mJ)')
-    axes[2].set_title('Energy (Lower is Better)')
-    axes[2].grid(True, alpha=0.3, axis='y')
-    best = np.argmin(energies)
-    bars[best].set_edgecolor('gold')
-    bars[best].set_linewidth(3)
-
-    fig2.tight_layout()
-    fig2.savefig(f"{save_dir}/2_policy_comparison.png", dpi=150, bbox_inches='tight')
-
-    # ── FIGURE 3: Offload Ratio ──────────────────────────────────────────
-    fig3, ax = plt.subplots(figsize=(10, 6))
-    fig3.suptitle('Task Processing Distribution per Policy', fontsize=16, fontweight='bold')
-
-    local_ratios = [results[p]['local_ratio'] * 100 for p in policies]
-    offload_ratios = [results[p]['offload_ratio'] * 100 for p in policies]
-
-    b1 = ax.bar(x, local_ratios, 0.6, label='Local Processing', color='#3498db', edgecolor='black', linewidth=0.5)
-    b2 = ax.bar(x, offload_ratios, 0.6, bottom=local_ratios, label='Offloaded to UAV', color='#e74c3c', edgecolor='black', linewidth=0.5)
-    ax.set_xticks(x)
-    ax.set_xticklabels(policies, fontweight='bold')
-    ax.set_ylabel('Percentage (%)')
-    ax.legend(loc='upper right', fontsize=11)
-    ax.set_ylim(0, 110)
-    ax.grid(True, alpha=0.3, axis='y')
-
-    # Add percentage labels inside bars
-    for i in range(len(policies)):
-        if local_ratios[i] > 5:
-            ax.text(x[i], local_ratios[i] / 2, f'{local_ratios[i]:.1f}%',
-                    ha='center', va='center', fontweight='bold', color='white', fontsize=11)
-        if offload_ratios[i] > 5:
-            ax.text(x[i], local_ratios[i] + offload_ratios[i] / 2, f'{offload_ratios[i]:.1f}%',
-                    ha='center', va='center', fontweight='bold', color='white', fontsize=11)
-
-    fig3.tight_layout()
-    fig3.savefig(f"{save_dir}/3_offload_ratio.png", dpi=150, bbox_inches='tight')
-
-    # ── FIGURE 4: Detailed Energy + Delay Comparison ─────────────────────
-    fig4, axes = plt.subplots(1, 2, figsize=(14, 6))
-    fig4.suptitle('DQN Advantage: Energy and Delay Breakdown', fontsize=16, fontweight='bold')
-
-    # Energy comparison with value labels
-    bars = axes[0].bar(x, energies, color=colors, edgecolor='black', linewidth=0.5)
-    axes[0].set_xticks(x)
-    axes[0].set_xticklabels(policies, fontweight='bold')
-    axes[0].set_ylabel('Average Energy (mJ)', fontsize=12)
-    axes[0].set_title('Energy Consumption Comparison')
-    axes[0].grid(True, alpha=0.3, axis='y')
-    for i, (bar, val) in enumerate(zip(bars, energies)):
-        axes[0].text(bar.get_x() + bar.get_width() / 2, bar.get_height() + max(energies) * 0.02,
-                     f'{val:.1f}', ha='center', va='bottom', fontweight='bold', fontsize=10)
-
-    # Delay comparison with value labels
-    bars = axes[1].bar(x, delays, color=colors, edgecolor='black', linewidth=0.5)
-    axes[1].set_xticks(x)
-    axes[1].set_xticklabels(policies, fontweight='bold')
-    axes[1].set_ylabel('Average Delay (ms)', fontsize=12)
-    axes[1].set_title('Delay Comparison')
-    axes[1].grid(True, alpha=0.3, axis='y')
-    for i, (bar, val) in enumerate(zip(bars, delays)):
-        axes[1].text(bar.get_x() + bar.get_width() / 2, bar.get_height() + max(delays) * 0.02,
-                     f'{val:.1f}', ha='center', va='bottom', fontweight='bold', fontsize=10)
-
-    fig4.tight_layout()
-    fig4.savefig(f"{save_dir}/4_energy_delay_detail.png", dpi=150, bbox_inches='tight')
-
-    # ── FIGURE 5: Network Topology ───────────────────────────────────────
-    fig5, ax = plt.subplots(figsize=(10, 10))
-    fig5.suptitle('Network Topology: Devices and UAVs', fontsize=16, fontweight='bold')
-
-    # Plot ground devices
-    dev_x = env.device_positions[:, 0]
-    dev_y = env.device_positions[:, 1]
-    ax.scatter(dev_x, dev_y, c='blue', s=120, marker='s', label='Ground Devices', zorder=3, edgecolors='black')
-    for i, (px, py) in enumerate(zip(dev_x, dev_y)):
-        ax.annotate(f'D{i}', (px, py), textcoords="offset points", xytext=(6, 6), fontsize=8)
-
-    # Plot UAVs
-    uav_x = [p[0] for p in env.uav_positions]
-    uav_y = [p[1] for p in env.uav_positions]
-    ax.scatter(uav_x, uav_y, c='red', s=350, marker='^', label='UAVs', zorder=4, edgecolors='black', linewidths=1.5)
-    for i, pos in enumerate(env.uav_positions):
-        ax.annotate(f'UAV{i}\n(h={pos[2]:.0f}m)', (pos[0], pos[1]),
-                    textcoords="offset points", xytext=(10, 10), fontsize=9, fontweight='bold')
-
-    # Coverage circles
-    for i, pos in enumerate(env.uav_positions):
-        circle = plt.Circle((pos[0], pos[1]), 200, color='red', fill=False,
-                             linestyle='--', alpha=0.3, label='Coverage' if i == 0 else '')
-        ax.add_patch(circle)
-
-    # Draw lines from each device to nearest UAV
-    for d in range(env.num_devices):
-        _, nearest = env._calculate_distance_to_nearest_uav(d)
-        ax.plot([dev_x[d], uav_x[nearest]], [dev_y[d], uav_y[nearest]],
-                'gray', alpha=0.2, linewidth=0.8, linestyle=':')
-
-    ax.set_xlabel('X Position (m)', fontsize=12)
-    ax.set_ylabel('Y Position (m)', fontsize=12)
-    ax.set_title(f'{env.num_devices} Ground Devices + {env.num_uavs} UAVs in {env.area_size}m x {env.area_size}m area')
-    ax.legend(loc='upper right', fontsize=11)
-    ax.set_xlim(-30, env.area_size + 30)
-    ax.set_ylim(-30, env.area_size + 30)
-    ax.set_aspect('equal')
-    ax.grid(True, alpha=0.3)
-
-    fig5.tight_layout()
-    fig5.savefig(f"{save_dir}/5_network_topology.png", dpi=150, bbox_inches='tight')
-
-    print(f"\nPlots saved to {save_dir}/")
-    print("Displaying plots...")
-    plt.show()
-
-
-# ==============================================================================
-# PART 9: MAIN FUNCTION
-# ==============================================================================
-
-def main():
-    """Main function to run the complete experiment."""
-
-    print("""
-    ╔═══════════════════════════════════════════════════════════════════════╗
-    ║                                                                       ║
-    ║   DQN FOR UAV TASK OFFLOADING - COMPLETE TUTORIAL                     ║
-    ║                                                                       ║
-    ║   This program demonstrates Deep Q-Network for task offloading        ║
-    ║   in UAV-assisted edge computing networks.                            ║
-    ║                                                                       ║
-    ╚═══════════════════════════════════════════════════════════════════════╝
-    """)
-
-    # Configuration
-    NUM_DEVICES = 10
-    NUM_UAVS = 3
-    TRAIN_EPISODES = 500
-    EVAL_EPISODES = 100
-
-    # Reward weights - adjust these to prioritize delay vs energy
-    DELAY_WEIGHT = 0.3   # Lower weight for delay
-    ENERGY_WEIGHT = 0.7  # Higher weight for energy (prioritize energy saving!)
-
-    print("CONFIGURATION:")
-    print(f"  Ground Devices: {NUM_DEVICES}")
-    print(f"  UAVs: {NUM_UAVS}")
-    print(f"  Training Episodes: {TRAIN_EPISODES}")
-    print(f"  Evaluation Episodes: {EVAL_EPISODES}")
-    print(f"  Delay Weight: {DELAY_WEIGHT}")
-    print(f"  Energy Weight: {ENERGY_WEIGHT} (prioritizing energy!)")
-
-    # Create environment
-    print("\n[1/4] Creating environment...")
-    env = UAVOffloadingEnv(
-        num_devices=NUM_DEVICES,
-        num_uavs=NUM_UAVS,
-        episode_length=100,
-        delay_weight=DELAY_WEIGHT,
-        energy_weight=ENERGY_WEIGHT
-    )
-
-    # Create DQN agent
-    print("[2/4] Creating DQN agent...")
-    agent = DQNAgent(
-        state_dim=env.state_dim,
-        action_dim=env.action_dim,
-        hidden_dims=[64, 64],
-        learning_rate=0.001,
-        gamma=0.99,
-        epsilon_start=1.0,
-        epsilon_end=0.01,
-        epsilon_decay=0.995,
-        buffer_size=10000,
-        batch_size=64,
-        target_update_freq=10
-    )
-
-    # Train
-    print("[3/4] Training DQN agent...")
-    start_time = time.time()
-    history = train_dqn(env, agent, TRAIN_EPISODES, print_every=50)
-    print(f"\nTraining completed in {time.time() - start_time:.1f} seconds")
-
-    # Evaluate and compare
-    print("\n[4/4] Evaluating policies...")
-    results = compare_policies(env, agent, EVAL_EPISODES)
-
-    # Generate plots
-    plot_results(history, results, env)
-
-    # Final summary
-    print("\n" + "=" * 60)
-    print("EXPERIMENT COMPLETE!")
-    print("=" * 60)
-    print(f"""
-    DQN learned to make intelligent offloading decisions!
-
-    Key Results:
-    - DQN Reward: {results['DQN']['avg_reward']:.2f}
-    - DQN Delay: {results['DQN']['avg_delay']*1000:.1f} ms
-    - DQN Offload Ratio: {results['DQN']['offload_ratio']*100:.1f}%
-
-    Improvements over baselines:
-    - vs All Local: {((results['DQN']['avg_reward'] - results['All Local']['avg_reward']) / abs(results['All Local']['avg_reward'])) * 100:+.1f}%
-    - vs All Offload: {((results['DQN']['avg_reward'] - results['All Offload']['avg_reward']) / abs(results['All Offload']['avg_reward'])) * 100:+.1f}%
-    - vs Random: {((results['DQN']['avg_reward'] - results['Random']['avg_reward']) / abs(results['Random']['avg_reward'])) * 100:+.1f}%
-
-    Check ./results/ folder for visualization plots!
-    """)
-
-    return agent, history, results
-
-
-# ==============================================================================
-# RUN
-# ==============================================================================
-
-if __name__ == "__main__":
-    agent, history, results = main()
+    def __init__(self, state_size, action_size, dueling=False):
+        self.state_size    = state_size
+        self.action_size   = action_size
+        self.memory        = deque(maxlen=20000)
+        self.batch_size    = 64
+        self.gamma         = 0.95
+        self.epsilon       = 1.0
+        self.epsilon_min   = 0.01
+        self.epsilon_decay = 0.99995
+        self.lr            = 0.0005
+        self.tau           = 0.005   # soft target update rate
+
+        NetClass          = DuelingDQNNet if dueling else DQNNet
+        self.model        = NetClass(state_size, action_size)
+        self.target_model = NetClass(state_size, action_size)
+        self.optimizer    = optim.Adam(self.model.parameters(), lr=self.lr)
+        self.loss_fn      = nn.SmoothL1Loss()  # Huber loss for robustness
+        self._hard_update_target()
+
+    def _hard_update_target(self):
+        self.target_model.load_state_dict(self.model.state_dict())
+
+    def _soft_update_target(self):
+        """Polyak averaging: slowly blend online weights into target."""
+        for tp, op in zip(self.target_model.parameters(), self.model.parameters()):
+            tp.data.copy_(self.tau * op.data + (1.0 - self.tau) * tp.data)
+
+    def act(self, state):
+        if random.random() < self.epsilon:
+            return random.randrange(self.action_size)
+        with torch.no_grad():
+            q = self.model(torch.FloatTensor(state).unsqueeze(0))
+        return q.argmax().item()
+
+    def remember(self, s, a, r, s2):
+        self.memory.append((s, a, r, s2))
+
+    def learn(self):
+        if len(self.memory) < self.batch_size:
+            return None
+
+        batch       = random.sample(self.memory, self.batch_size)
+        s, a, r, s2 = zip(*batch)
+
+        s  = torch.FloatTensor(np.array(s))
+        a  = torch.LongTensor(a)
+        r  = torch.FloatTensor(r)
+        s2 = torch.FloatTensor(np.array(s2))
+
+        # Current Q-values
+        current_q = self.model(s).gather(1, a.unsqueeze(1)).squeeze()
+
+        # Double DQN: online network selects best action, target evaluates it
+        with torch.no_grad():
+            best_actions = self.model(s2).argmax(1)
+            next_q = self.target_model(s2).gather(1, best_actions.unsqueeze(1)).squeeze()
+        target_q = r + self.gamma * next_q
+
+        loss = self.loss_fn(current_q, target_q)
+        self.optimizer.zero_grad()
+        loss.backward()
+
+        # Gradient clipping for training stability
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 10.0)
+        self.optimizer.step()
+
+        # Soft target update every training step
+        self._soft_update_target()
+
+        if self.epsilon > self.epsilon_min:
+            self.epsilon *= self.epsilon_decay
+
+        return loss.item()
+
+
+# =============================================================
+#  TRAINING FUNCTION
+# =============================================================
+def train_agent(state_size, action_size, dueling, label):
+    agent = DQNAgent(state_size, action_size, dueling=dueling)
+    env   = UAVEnvironment()
+
+    latencies, drops, rewards, losses = [], [], [], []
+
+    print(f"\n{'=' * 65}")
+    print(f"  {label} -- 5 Devices, 1 UAV, {N_EPISODES} Episodes")
+    print(f"{'=' * 65}")
+    print(f"{'Episode':>8} | {'Avg Latency':>12} | {'Drop Rate':>10} | "
+          f"{'Avg Loss':>10} | {'Epsilon':>8}")
+    print("-" * 65)
+
+    for ep in range(N_EPISODES):
+        state      = env.reset()
+        ep_latency = []
+        ep_drops   = []
+        ep_reward  = 0.0
+        ep_losses  = []
+
+        for slot in range(N_SLOTS):
+            action = agent.act(state)
+            next_state, reward, total_lat, info, _, _ = env.step(action)
+
+            agent.remember(state, action, reward, next_state)
+            loss_val = agent.learn()
+
+            state      = next_state
+            ep_reward += reward
+
+            if loss_val is not None:
+                ep_losses.append(loss_val)
+
+            active = [x for x in info if x["action"] != "no task"]
+            if active:
+                ep_latency.append(total_lat / len(active))
+                ep_drops.append(
+                    sum(1 for x in active if x["dropped"]) / len(active))
+
+        avg_lat  = np.mean(ep_latency) if ep_latency else 0
+        avg_drop = np.mean(ep_drops)   if ep_drops   else 0
+        avg_loss = np.mean(ep_losses)  if ep_losses  else 0
+
+        latencies.append(avg_lat)
+        drops.append(avg_drop)
+        rewards.append(ep_reward)
+        losses.append(avg_loss)
+
+        if ep % 50 == 0:
+            print(f"{ep:>8} | {avg_lat:>12.4f}s | {avg_drop:>9.1%} | "
+                  f"{avg_loss:>10.4f} | {agent.epsilon:>8.3f}")
+
+    print(f"\n  {label} complete!")
+    print(f"   Last 50 ep avg latency: {np.mean(latencies[-50:]):.4f}s")
+    return latencies, drops, rewards, losses, env, agent
+
+
+# =============================================================
+#  BASELINE RUNNER
+# =============================================================
+def run_baseline(name, action_fn):
+    latencies, rewards = [], []
+    print(f"Running {name}...")
+    for ep in range(N_EPISODES):
+        env_b = UAVEnvironment()
+        env_b.reset()
+        ep_lat, ep_rew = [], 0.0
+        for slot in range(N_SLOTS):
+            _, reward, total_lat, info, _, _ = env_b.step(action_fn())
+            ep_rew += reward
+            active = [x for x in info if x["action"] != "no task"]
+            if active:
+                ep_lat.append(total_lat / len(active))
+        latencies.append(np.mean(ep_lat) if ep_lat else 0)
+        rewards.append(ep_rew)
+    print(f"  {name}: {np.mean(latencies):.4f}s")
+    return latencies, rewards
+
+
+# =============================================================
+#  TRAIN BOTH AGENTS
+# =============================================================
+env_tmp = UAVEnvironment()
+state_size  = env_tmp.state_size
+action_size = env_tmp.action_size
+
+std_latencies,  std_drops,  std_rewards,  std_losses,  env_std,  std_agent  = train_agent(
+    state_size, action_size, dueling=False, label="Standard DQN")
+
+duel_latencies, duel_drops, duel_rewards, duel_losses, env_duel, duel_agent = train_agent(
+    state_size, action_size, dueling=True,  label="Dueling DQN")
+
+# =============================================================
+#  RUN BASELINES
+# =============================================================
+print("\nRunning baselines...")
+local_lat,   local_rew   = run_baseline("All Local",   lambda: 0)
+offload_lat, offload_rew = run_baseline("All Offload", lambda: 2**N_DEVICES - 1)
+random_lat,  random_rew  = run_baseline("Random",      lambda: random.randrange(2**N_DEVICES))
+
+# =============================================================
+#  FINAL SUMMARY
+# =============================================================
+duel_avg    = np.mean(duel_latencies[-50:])
+std_avg     = np.mean(std_latencies[-50:])
+local_avg   = np.mean(local_lat[-50:])
+offload_avg = np.mean(offload_lat[-50:])
+random_avg  = np.mean(random_lat[-50:])
+
+print(f"\n{'=' * 55}")
+print(f"  FINAL COMPARISON")
+print(f"{'=' * 55}")
+print(f"  Dueling DQN  : {duel_avg:.4f}s  <- proposed")
+print(f"  Standard DQN : {std_avg:.4f}s  ({(1-duel_avg/std_avg)*100:.1f}% better with Dueling)")
+print(f"  Random       : {random_avg:.4f}s  ({(1-duel_avg/random_avg)*100:.1f}% better than Random)")
+print(f"  All Offload  : {offload_avg:.4f}s  ({(1-duel_avg/offload_avg)*100:.1f}% better than All Offload)")
+print(f"  All Local    : {local_avg:.4f}s  ({(1-duel_avg/local_avg)*100:.1f}% better than All Local)")
+
+
+# =============================================================
+#  PLOTS
+# =============================================================
+os.makedirs('/mnt/user-data/outputs', exist_ok=True)
+
+window = 30
+
+def moving_avg(data, w):
+    return np.convolve(data, np.ones(w)/w, mode='valid')
+
+x_range = range(window - 1, N_EPISODES)
+
+fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+fig.suptitle("Dueling DQN vs Standard DQN vs Baselines -- 5 Devices, 1 UAV",
+             fontsize=14, fontweight='bold')
+
+lines = [
+    (duel_rewards,   duel_latencies,   'blue',       '-',  'Dueling DQN'),
+    (std_rewards,    std_latencies,    'deepskyblue','--', 'Standard DQN'),
+    (random_rew,     random_lat,       'darkorange', ':',  'Random'),
+    (offload_rew,    offload_lat,      'green',      '-.', 'All Offload'),
+    (local_rew,      local_lat,        'red',        '--', 'All Local'),
+]
+
+# Plot 1: Reward
+for rews, _, color, style, label in lines:
+    axes[0, 0].plot(rews, alpha=0.1, color=color)
+    axes[0, 0].plot(x_range, moving_avg(rews, window),
+                    color=color, linewidth=2.5, linestyle=style, label=label)
+axes[0, 0].set_title('Episode Reward')
+axes[0, 0].set_xlabel('Episode')
+axes[0, 0].set_ylabel('Total Reward')
+axes[0, 0].legend(fontsize=10)
+axes[0, 0].grid(True)
+
+# Plot 2: Loss comparison
+axes[0, 1].plot(duel_losses, alpha=0.2, color='blue')
+axes[0, 1].plot(x_range, moving_avg(duel_losses, window),
+                color='blue', linewidth=2.5, label='Dueling DQN')
+axes[0, 1].plot(std_losses, alpha=0.2, color='deepskyblue')
+axes[0, 1].plot(x_range, moving_avg(std_losses, window),
+                color='deepskyblue', linewidth=2.5, linestyle='--', label='Standard DQN')
+axes[0, 1].set_title('Training Loss: Dueling vs Standard DQN')
+axes[0, 1].set_xlabel('Episode')
+axes[0, 1].set_ylabel('Huber Loss')
+axes[0, 1].legend(fontsize=10)
+axes[0, 1].grid(True)
+
+# Plot 3: Latency
+for _, lats, color, style, label in lines:
+    axes[1, 0].plot(lats, alpha=0.1, color=color)
+    axes[1, 0].plot(x_range, moving_avg(lats, window),
+                    color=color, linewidth=2.5, linestyle=style, label=label)
+axes[1, 0].axhline(SLOT_DURATION, color='black', linestyle=':',
+                   linewidth=1.5, label=f'Slot limit ({SLOT_DURATION}s)')
+axes[1, 0].set_title('Average Latency per Episode')
+axes[1, 0].set_xlabel('Episode')
+axes[1, 0].set_ylabel('Avg Latency (s)')
+axes[1, 0].legend(fontsize=10)
+axes[1, 0].grid(True)
+
+# Plot 4: Per-device Dueling DQN
+state = env_duel.reset()
+d_lat = [[] for _ in range(N_DEVICES)]
+d_dec = [[] for _ in range(N_DEVICES)]
+for slot in range(N_SLOTS):
+    action = duel_agent.act(state)
+    next_state, _, _, info, _, _ = env_duel.step(action)
+    state = next_state
+    for x in info:
+        i = x["device"]
+        if x["action"] != "no task":
+            d_lat[i].append(x["latency"])
+            d_dec[i].append(1 if x["action"] == "offload" else 0)
+
+labels  = [f"D{i}\n({DISTANCES[i]:.0f}m)" for i in range(N_DEVICES)]
+avgs    = [np.mean(d_lat[i]) if d_lat[i] else 0 for i in range(N_DEVICES)]
+offrate = [np.mean(d_dec[i]) if d_dec[i] else 0 for i in range(N_DEVICES)]
+colors_bar  = ['#2ecc71', '#3498db', '#e74c3c', '#f39c12', '#9b59b6']
+
+bars = axes[1, 1].bar(labels, avgs, color=colors_bar, edgecolor='black', linewidth=0.8)
+for bar, rate in zip(bars, offrate):
+    axes[1, 1].text(bar.get_x() + bar.get_width() / 2,
+                    bar.get_height() + 0.001,
+                    f'{rate:.0%}',
+                    ha='center', va='bottom', fontsize=9)
+axes[1, 1].axhline(SLOT_DURATION, color='black', linestyle='--',
+                   label=f'Slot limit ({SLOT_DURATION}s)')
+axes[1, 1].set_title('Final Episode: Per-Device Latency (Dueling DQN)')
+axes[1, 1].set_ylabel('Avg Latency (s)')
+axes[1, 1].legend(fontsize=10)
+axes[1, 1].grid(True, axis='y')
+
+plt.tight_layout()
+plt.savefig('/mnt/user-data/outputs/result_dueling_final.png', dpi=150, bbox_inches='tight')
+plt.show()
+print("\nPlot saved as /mnt/user-data/outputs/result_dueling_final.png")
