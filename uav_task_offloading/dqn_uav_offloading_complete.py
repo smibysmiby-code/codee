@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-LLM-GUIDED DQN FOR UAV TASK OFFLOADING - COMPLETE IMPLEMENTATION
+HEURISTIC-GUIDED DQN FOR UAV TASK OFFLOADING - COMPLETE IMPLEMENTATION
 ================================================================================
 
-Compares Standard DQN vs Dueling DQN vs LLM-Guided Dueling DQN
+Compares Standard DQN vs Dueling DQN vs Heuristic-Guided Dueling DQN
 for binary task offloading in UAV-assisted edge computing networks.
 
 To run: python dqn_uav_offloading_complete.py
 
-Dependencies: pip install numpy matplotlib torch anthropic
+Dependencies: pip install numpy matplotlib torch
 
 ================================================================================
 KEY FEATURES:
@@ -20,7 +20,7 @@ KEY FEATURES:
 4. Soft target updates for smoother learning
 5. Larger replay buffer for better sample diversity
 6. Huber loss for robust training
-7. LLM-guided exploration for faster early convergence
+7. Cost-based heuristic-guided exploration for faster early convergence
 ================================================================================
 """
 
@@ -34,7 +34,6 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import os
-import anthropic  # pip install anthropic
 
 # =============================================================
 #  SYSTEM PARAMETERS
@@ -68,80 +67,81 @@ DEVICE_POSITIONS = [
 DROP_PENALTY = 0.15
 DISTANCES    = [np.linalg.norm(UAV_POS - dp) for dp in DEVICE_POSITIONS]
 
-# LLM guidance settings
-LLM_EPSILON_THRESHOLD = 0.5   # only use LLM when epsilon > 0.5 (early training)
-LLM_CALL_PROB         = 0.3   # 30% of exploration steps use LLM (rest still random)
-                               # keeps API calls fast and affordable
+# Heuristic guidance settings
+HEUR_EPSILON_THRESHOLD = 0.4   # only use heuristic when epsilon > 0.4 (early training)
+HEUR_CALL_PROB         = 0.25  # 25% of exploration steps use heuristic (rest random)
+HEUR_NOISE_PROB        = 0.10  # 10% chance to flip each device decision (diversity)
 
 
 # =============================================================
-#  LLM GUIDANCE FUNCTION
+#  COST-BASED HEURISTIC GUIDANCE FUNCTION
 # =============================================================
-client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from environment
+def heuristic_suggest_action(state, tasks):
+    """
+    Cost-based heuristic: computes actual local vs offload latency for
+    each device, accounts for cumulative UAV queue, and picks the
+    lower-cost option.  Devices that MUST offload (local would drop)
+    are processed first to get priority queue access.
 
-def llm_suggest_action(state, tasks):
+    A small noise probability flips individual decisions to maintain
+    exploration diversity and prevent excessive bias in the replay buffer.
     """
-    Ask Claude to suggest which devices to offload.
-    Returns an integer action (0-31) based on LLM recommendation.
-    Falls back to random if LLM call fails.
-    """
-    # Build a human-readable description of the current state
-    device_info = []
+    queue_time = state[-1] * SLOT_DURATION  # de-normalise queue load
+
+    # ---------- gather per-device cost info ----------
+    device_costs = []
     for i in range(N_DEVICES):
-        if tasks[i] is not None:
-            D, C = tasks[i]
-            cycles_M  = C / 1e6
-            size_Mb   = D / 1e6
-            local_time = C / F_LOCAL
-            device_info.append(
-                f"  Device {i} (dist={DISTANCES[i]:.0f}m): "
-                f"{cycles_M:.1f}M cycles, {size_Mb:.2f}Mb, "
-                f"local_time={local_time:.3f}s"
-            )
-        else:
-            device_info.append(f"  Device {i}: no task")
+        if tasks[i] is None:
+            device_costs.append(None)
+            continue
+        D, C = tasks[i]
 
-    queue_load = state[-1]  # last element of state is normalized queue
-    devices_str = "\n".join(device_info)
+        local_time = C / F_LOCAL
 
-    prompt = f"""You are a UAV task offloading controller. Decide for each device: offload to UAV (1) or execute locally (0).
+        SNR      = P_TX / (N0 * DISTANCES[i] ** 2)
+        R        = B * np.log2(1 + SNR)
+        t_upload = D / R
+        t_exec   = C / F_UAV
+        # benefit of offloading (positive = offloading saves time)
+        benefit  = local_time - (t_upload + t_exec)
 
-Current situation:
-{devices_str}
-  UAV queue load: {queue_load:.0%}
+        device_costs.append({
+            'idx': i,
+            'local_time': local_time,
+            't_upload': t_upload,
+            't_exec': t_exec,
+            'benefit': benefit,
+            'must_offload': local_time > SLOT_DURATION,
+        })
 
-Rules:
-- If local_time > 0.1s → MUST offload (will be dropped otherwise)
-- If local_time < 0.01s → prefer local (saves UAV queue)
-- If UAV queue > 70% full → prefer local to avoid overload
-- Otherwise → offload if local_time > 0.03s
+    # ---------- sort: must-offload first, then by descending benefit ----------
+    active = [d for d in device_costs if d is not None]
+    active.sort(key=lambda d: (-int(d['must_offload']), -d['benefit']))
 
-Respond with EXACTLY 5 digits (one per device), 0=local 1=offload.
-Example: 10110
-Only output the 5 digits, nothing else."""
+    decisions = [0] * N_DEVICES
+    estimated_queue = queue_time
 
-    try:
-        message = client.messages.create(
-            model="claude-haiku-4-5-20251001",   # fast + cheap model
-            max_tokens=10,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        response = message.content[0].text.strip()
+    for d in active:
+        i = d['idx']
+        local_time = d['local_time']
+        local_dropped = local_time > SLOT_DURATION
+        local_cost = DROP_PENALTY if local_dropped else local_time
 
-        # Parse response: expect exactly 5 binary digits
-        response = ''.join(c for c in response if c in '01')
+        offload_time = d['t_upload'] + max(0.0, estimated_queue) + d['t_exec']
+        offload_dropped = offload_time > SLOT_DURATION
+        offload_cost = DROP_PENALTY if offload_dropped else offload_time
 
-        if len(response) == N_DEVICES:
-            # FIX: Reverse the string so device 0 maps to bit 0 (LSB).
-            # The LLM returns "ABCDE" where A=device0, but int("ABCDE", 2)
-            # treats A as the MSB. Reversing aligns device i with bit i.
-            action = int(response[::-1], 2)
-            return action
-        else:
-            return random.randrange(2**N_DEVICES)
-    except Exception:
-        # Fallback to random if API call fails
-        return random.randrange(2**N_DEVICES)
+        if offload_cost < local_cost:
+            decisions[i] = 1
+            estimated_queue += d['t_exec']
+
+    # ---------- inject noise for exploration diversity ----------
+    for i in range(N_DEVICES):
+        if random.random() < HEUR_NOISE_PROB:
+            decisions[i] = 1 - decisions[i]
+
+    action = sum(d << i for i, d in enumerate(decisions))
+    return action
 
 
 # =============================================================
@@ -278,14 +278,14 @@ class DuelingDQNNet(nn.Module):
 
 
 # =============================================================
-#  GENERIC AGENT -- Standard or Dueling, with optional LLM
+#  GENERIC AGENT -- Standard or Dueling, with optional Heuristic
 # =============================================================
 class DQNAgent:
-    def __init__(self, state_size, action_size, dueling=False, use_llm=False):
-        self.state_size    = state_size
-        self.action_size   = action_size
-        self.use_llm       = use_llm
-        self.llm_calls     = 0
+    def __init__(self, state_size, action_size, dueling=False, use_heuristic=False):
+        self.state_size      = state_size
+        self.action_size     = action_size
+        self.use_heuristic   = use_heuristic
+        self.heuristic_calls = 0
         self.memory        = deque(maxlen=20000)
         self.batch_size    = 64
         self.gamma         = 0.95
@@ -312,9 +312,9 @@ class DQNAgent:
 
     def act(self, state, tasks=None):
         """
-        LLM-guided epsilon-greedy:
-          - epsilon > LLM_EPSILON_THRESHOLD AND random < LLM_CALL_PROB
-            -> ask LLM for smart action
+        Heuristic-guided epsilon-greedy:
+          - epsilon > HEUR_EPSILON_THRESHOLD AND random < HEUR_CALL_PROB
+            -> use cost-based heuristic for smart action
           - else if random < epsilon
             -> random action
           - else
@@ -322,12 +322,12 @@ class DQNAgent:
         """
         if random.random() < self.epsilon:
             # Exploration phase
-            if (self.use_llm
+            if (self.use_heuristic
                     and tasks is not None
-                    and self.epsilon > LLM_EPSILON_THRESHOLD
-                    and random.random() < LLM_CALL_PROB):
-                self.llm_calls += 1
-                return llm_suggest_action(state, tasks)
+                    and self.epsilon > HEUR_EPSILON_THRESHOLD
+                    and random.random() < HEUR_CALL_PROB):
+                self.heuristic_calls += 1
+                return heuristic_suggest_action(state, tasks)
             else:
                 return random.randrange(self.action_size)
         else:
@@ -375,21 +375,21 @@ class DQNAgent:
 # =============================================================
 #  TRAINING FUNCTION
 # =============================================================
-def train_agent(state_size, action_size, dueling, use_llm, label):
+def train_agent(state_size, action_size, dueling, use_heuristic, label):
     agent = DQNAgent(state_size, action_size,
-                     dueling=dueling, use_llm=use_llm)
+                     dueling=dueling, use_heuristic=use_heuristic)
     env   = UAVEnvironment()
 
     latencies, drops, rewards, losses = [], [], [], []
 
     print(f"\n{'=' * 70}")
     print(f"  {label} -- 5 Devices, 1 UAV, {N_EPISODES} Episodes")
-    if use_llm:
-        print(f"  LLM guidance: ON  (epsilon>{LLM_EPSILON_THRESHOLD}, "
-              f"call_prob={LLM_CALL_PROB})")
+    if use_heuristic:
+        print(f"  Heuristic guidance: ON  (epsilon>{HEUR_EPSILON_THRESHOLD}, "
+              f"call_prob={HEUR_CALL_PROB})")
     print(f"{'=' * 70}")
     print(f"{'Episode':>8} | {'Avg Latency':>12} | {'Drop Rate':>10} | "
-          f"{'Avg Loss':>10} | {'Epsilon':>8} | {'LLM calls':>10}")
+          f"{'Avg Loss':>10} | {'Epsilon':>8} | {'Heur calls':>10}")
     print("-" * 75)
 
     for ep in range(N_EPISODES):
@@ -400,7 +400,7 @@ def train_agent(state_size, action_size, dueling, use_llm, label):
         ep_losses  = []
 
         for slot in range(N_SLOTS):
-            # Pass current tasks to agent so LLM can read them
+            # Pass current tasks to agent for heuristic guidance
             action = agent.act(state, tasks=env.current_tasks)
             next_state, reward, total_lat, info, _, _ = env.step(action)
 
@@ -431,11 +431,11 @@ def train_agent(state_size, action_size, dueling, use_llm, label):
         if ep % 50 == 0:
             print(f"{ep:>8} | {avg_lat:>12.4f}s | {avg_drop:>9.1%} | "
                   f"{avg_loss:>10.4f} | {agent.epsilon:>8.3f} | "
-                  f"{agent.llm_calls:>10}")
+                  f"{agent.heuristic_calls:>10}")
 
     print(f"\n  {label} complete!")
     print(f"   Last 50 ep avg latency : {np.mean(latencies[-50:]):.4f}s")
-    print(f"   Total LLM API calls    : {agent.llm_calls}")
+    print(f"   Total heuristic calls  : {agent.heuristic_calls}")
     return latencies, drops, rewards, losses, env, agent
 
 
@@ -468,23 +468,23 @@ env_tmp     = UAVEnvironment()
 state_size  = env_tmp.state_size
 action_size = env_tmp.action_size
 
-# 1. Standard DQN (no LLM, no Dueling)
+# 1. Standard DQN (no guidance, no Dueling)
 std_lat,  std_drop,  std_rew,  std_loss,  _, std_agent  = train_agent(
     state_size, action_size,
-    dueling=False, use_llm=False,
+    dueling=False, use_heuristic=False,
     label="Standard DQN")
 
-# 2. Dueling DQN (no LLM)
+# 2. Dueling DQN (no guidance)
 duel_lat, duel_drop, duel_rew, duel_loss, _, duel_agent = train_agent(
     state_size, action_size,
-    dueling=True, use_llm=False,
+    dueling=True, use_heuristic=False,
     label="Dueling DQN")
 
-# 3. LLM-Guided Dueling DQN -- proposed method
-llm_lat,  llm_drop,  llm_rew,  llm_loss,  env_llm, llm_agent = train_agent(
+# 3. Heuristic-Guided Dueling DQN -- proposed method
+heur_lat, heur_drop, heur_rew, heur_loss, env_heur, heur_agent = train_agent(
     state_size, action_size,
-    dueling=True, use_llm=True,
-    label="LLM-Guided Dueling DQN")
+    dueling=True, use_heuristic=True,
+    label="Heuristic-Guided Dueling DQN")
 
 
 # =============================================================
@@ -507,18 +507,18 @@ print(f"  FINAL COMPARISON")
 print(f"{'=' * 60}")
 
 results = [
-    ("LLM Dueling DQN", np.mean(llm_lat[-50:])),
-    ("Dueling DQN",     np.mean(duel_lat[-50:])),
-    ("Standard DQN",    np.mean(std_lat[-50:])),
-    ("Random",          np.mean(random_lat[-50:])),
-    ("All Offload",     np.mean(offload_lat[-50:])),
-    ("All Local",       np.mean(local_lat[-50:])),
+    ("Heur Dueling DQN",  np.mean(heur_lat[-50:])),
+    ("Dueling DQN",       np.mean(duel_lat[-50:])),
+    ("Standard DQN",      np.mean(std_lat[-50:])),
+    ("Random",            np.mean(random_lat[-50:])),
+    ("All Offload",       np.mean(offload_lat[-50:])),
+    ("All Local",         np.mean(local_lat[-50:])),
 ]
 best = results[0][1]
 
 for name, val in results:
     improvement = (1 - best/val)*100 if val != best else 0
-    marker = " <- proposed" if name == "LLM Dueling DQN" else \
+    marker = " <- proposed" if name == "Heur Dueling DQN" else \
              f"  ({improvement:.1f}% worse)" if improvement > 0 else ""
     print(f"  {name:<20}: {val:.4f}s{marker}")
 
@@ -537,11 +537,11 @@ x_range = range(window - 1, N_EPISODES)
 
 fig, axes = plt.subplots(2, 3, figsize=(21, 12))
 fig.suptitle(
-    "LLM-Guided Dueling DQN for UAV Task Offloading -- 5 Devices, 1 UAV",
+    "Heuristic-Guided Dueling DQN for UAV Task Offloading -- 5 Devices, 1 UAV",
     fontsize=14, fontweight='bold')
 
 all_lines = [
-    (llm_rew,    llm_lat,    'blue',       '-',  'LLM Dueling DQN (proposed)'),
+    (heur_rew,   heur_lat,   'blue',       '-',  'Heur Dueling DQN (proposed)'),
     (duel_rew,   duel_lat,   'deepskyblue','--', 'Dueling DQN'),
     (std_rew,    std_lat,    'purple',     ':',  'Standard DQN'),
     (random_rew, random_lat, 'darkorange', ':',  'Random'),
@@ -577,7 +577,7 @@ axes[0, 1].grid(True)
 
 # ---- Plot 3: Convergence zoom (first 300 episodes) ----
 zoom_lines = [
-    (llm_lat[:300],  'blue',       '-',  'LLM Dueling DQN'),
+    (heur_lat[:300], 'blue',       '-',  'Heur Dueling DQN'),
     (duel_lat[:300], 'deepskyblue','--', 'Dueling DQN'),
     (std_lat[:300],  'purple',     ':',  'Standard DQN'),
 ]
@@ -596,7 +596,7 @@ axes[0, 2].grid(True)
 
 # ---- Plot 4: Training Loss ----
 for loss, color, style, label in [
-    (llm_loss,  'blue',       '-',  'LLM Dueling DQN'),
+    (heur_loss, 'blue',       '-',  'Heur Dueling DQN'),
     (duel_loss, 'deepskyblue','--', 'Dueling DQN'),
     (std_loss,  'purple',     ':',  'Standard DQN'),
 ]:
@@ -611,9 +611,9 @@ axes[1, 0].legend(fontsize=9)
 axes[1, 0].grid(True)
 
 # ---- Plot 5: Final Latency Bar ----
-methods    = ['LLM\nDueling', 'Dueling\nDQN', 'Standard\nDQN',
+methods    = ['Heur\nDueling', 'Dueling\nDQN', 'Standard\nDQN',
               'Random', 'All\nOffload', 'All\nLocal']
-lat_vals   = [np.mean(llm_lat[-50:]),     np.mean(duel_lat[-50:]),
+lat_vals   = [np.mean(heur_lat[-50:]),    np.mean(duel_lat[-50:]),
               np.mean(std_lat[-50:]),      np.mean(random_lat[-50:]),
               np.mean(offload_lat[-50:]),  np.mean(local_lat[-50:])]
 bar_colors = ['blue', 'deepskyblue', 'purple', 'darkorange', 'green', 'red']
@@ -628,13 +628,13 @@ axes[1, 1].set_title('Final Average Latency')
 axes[1, 1].set_ylabel('Avg Latency (s)')
 axes[1, 1].grid(True, axis='y')
 
-# ---- Plot 6: Per-device Latency (LLM-Dueling DQN) ----
-state = env_llm.reset()
+# ---- Plot 6: Per-device Latency (Heur-Dueling DQN) ----
+state = env_heur.reset()
 d_lat = [[] for _ in range(N_DEVICES)]
 d_dec = [[] for _ in range(N_DEVICES)]
 for slot in range(N_SLOTS):
-    action = llm_agent.act(state)
-    next_state, _, _, info, _, _ = env_llm.step(action)
+    action = heur_agent.act(state)
+    next_state, _, _, info, _, _ = env_heur.step(action)
     state = next_state
     for x in info:
         i = x["device"]
@@ -655,13 +655,13 @@ for bar, rate in zip(bars, offrates):
                     f'{rate:.0%}', ha='center', va='bottom', fontsize=9)
 axes[1, 2].axhline(SLOT_DURATION, color='black', linestyle='--',
                    label='Slot limit')
-axes[1, 2].set_title('Per-Device Latency: LLM Dueling DQN')
+axes[1, 2].set_title('Per-Device Latency: Heur Dueling DQN')
 axes[1, 2].set_ylabel('Avg Latency (s)')
 axes[1, 2].legend(fontsize=9)
 axes[1, 2].grid(True, axis='y')
 
 plt.tight_layout()
-plt.savefig('/mnt/user-data/outputs/result_llm_dqn.png',
+plt.savefig('/mnt/user-data/outputs/result_heur_dqn.png',
             dpi=150, bbox_inches='tight')
 plt.show()
-print("\nPlot saved as /mnt/user-data/outputs/result_llm_dqn.png")
+print("\nPlot saved as /mnt/user-data/outputs/result_heur_dqn.png")
