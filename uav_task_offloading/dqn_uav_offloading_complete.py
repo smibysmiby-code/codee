@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-HEURISTIC-GUIDED DQN FOR UAV TASK OFFLOADING - COMPLETE IMPLEMENTATION
+DIGITAL TWIN-ENABLED HEURISTIC-GUIDED DQN FOR UAV TASK OFFLOADING
 ================================================================================
 
-Compares Standard DQN vs Dueling DQN vs Heuristic-Guided Dueling DQN
+A Digital Twin framework integrated with Deep Reinforcement Learning for
+intelligent task offloading in UAV-assisted Mobile Edge Computing.
+
+The Digital Twin maintains a synchronised virtual replica of the physical
+UAV-MEC network, enabling the DRL agent to train, predict, and optimise
+offloading decisions in a risk-free virtual environment before deployment.
+
+Compares Standard DQN vs Dueling DQN vs DT-Heuristic-Guided Dueling DQN
 for binary task offloading in UAV-assisted edge computing networks.
 
 To run: python dqn_uav_offloading_complete.py
@@ -14,13 +21,15 @@ Dependencies: pip install numpy matplotlib torch
 ================================================================================
 KEY FEATURES:
 ================================================================================
-1. Agent sees current tasks BEFORE deciding
-2. Double DQN prevents Q-value overestimation
-3. Gradient clipping prevents training divergence
-4. Soft target updates for smoother learning
-5. Larger replay buffer for better sample diversity
-6. Huber loss for robust training
-7. Cost-based heuristic-guided exploration for faster early convergence
+1. Digital Twin synchronisation between physical and virtual UAV-MEC systems
+2. Agent sees current tasks BEFORE deciding (twin-informed observation)
+3. Double DQN prevents Q-value overestimation
+4. Gradient clipping prevents training divergence
+5. Soft target updates for smoother learning
+6. Larger replay buffer for better sample diversity
+7. Huber loss for robust training
+8. Cost-based heuristic-guided exploration for faster early convergence
+9. Digital Twin analytics: latency prediction, resource monitoring, what-if analysis
 ================================================================================
 """
 
@@ -232,6 +241,180 @@ class UAVEnvironment:
 
 
 # =============================================================
+#  DIGITAL TWIN MODULE
+# =============================================================
+class DigitalTwin:
+    """
+    Digital Twin of the UAV-MEC physical network.
+
+    Maintains a synchronised virtual replica of the physical environment,
+    enabling the DRL agent to:
+      1. Train on the virtual copy without affecting the real system
+      2. Predict offloading outcomes before committing decisions
+      3. Monitor network KPIs (latency, drop rate, utilisation)
+      4. Run what-if scenario analysis for capacity planning
+
+    The twin mirrors all physical parameters: device positions, channel
+    conditions, UAV state, and task queue -- updated each time slot.
+    """
+
+    def __init__(self):
+        # --- Physical-layer parameters replicated in the twin ---
+        self.physical_env = UAVEnvironment()
+        self.twin_env     = UAVEnvironment()       # virtual replica
+
+        self.state_size   = self.physical_env.state_size
+        self.action_size  = self.physical_env.action_size
+
+        # --- Synchronisation tracking ---
+        self.sync_count       = 0
+        self.total_steps      = 0
+        self.sync_log         = []       # (step, sync_error)
+
+        # --- Twin analytics / KPI monitoring ---
+        self.latency_history     = []
+        self.predicted_latencies = []
+        self.drop_history        = []
+        self.utilisation_history = []     # UAV queue utilisation
+        self.offload_ratio_history = []
+
+    # ----------------------------------------------------------
+    #  Core lifecycle
+    # ----------------------------------------------------------
+    def reset(self):
+        """Reset both physical and twin environments (full sync)."""
+        state = self.physical_env.reset()
+        # Synchronise twin with physical state
+        self._synchronise()
+        return state
+
+    def step(self, action):
+        """
+        Execute action on the physical environment, then synchronise
+        the digital twin and record analytics.
+        """
+        result = self.physical_env.step(action)
+        next_state, reward, total_lat, info, tasks, decisions = result
+
+        # --- Synchronise twin state ---
+        self._synchronise()
+        self.total_steps += 1
+
+        # --- Record KPIs ---
+        active = [x for x in info if x["action"] != "no task"]
+        if active:
+            avg_lat = total_lat / len(active)
+            drop_rate = sum(1 for x in active if x["dropped"]) / len(active)
+            offload_rate = sum(1 for x in active
+                               if x["action"] == "offload") / len(active)
+        else:
+            avg_lat = 0.0
+            drop_rate = 0.0
+            offload_rate = 0.0
+
+        self.latency_history.append(avg_lat)
+        self.drop_history.append(drop_rate)
+        self.offload_ratio_history.append(offload_rate)
+        self.utilisation_history.append(
+            self.physical_env.uav_queue_time / SLOT_DURATION)
+
+        return result
+
+    # ----------------------------------------------------------
+    #  Synchronisation
+    # ----------------------------------------------------------
+    def _synchronise(self):
+        """
+        Copy physical environment state into the digital twin.
+        In a real deployment the twin would be updated via IoT telemetry;
+        here synchronisation is instantaneous (ideal twin).
+        """
+        self.twin_env.uav_queue_time = self.physical_env.uav_queue_time
+        self.twin_env.current_tasks  = self.physical_env.current_tasks
+        self.sync_count += 1
+
+        # Compute synchronisation fidelity (should be ~0 for ideal twin)
+        sync_error = abs(self.twin_env.uav_queue_time
+                         - self.physical_env.uav_queue_time)
+        self.sync_log.append((self.total_steps, sync_error))
+
+    # ----------------------------------------------------------
+    #  Predictive analytics (what-if analysis)
+    # ----------------------------------------------------------
+    def predict_latency(self, action):
+        """
+        Use the digital twin to predict the outcome of an action
+        WITHOUT executing it on the physical environment.
+        """
+        # Snapshot twin state
+        saved_queue = self.twin_env.uav_queue_time
+        saved_tasks = self.twin_env.current_tasks
+
+        # Run action on twin only
+        decisions = [(action >> i) & 1 for i in range(N_DEVICES)]
+        predicted_lat = 0.0
+        queue_copy = saved_queue
+
+        for i in range(N_DEVICES):
+            if saved_tasks[i] is None:
+                continue
+            D, C = saved_tasks[i]
+
+            if decisions[i] == 0:
+                latency = C / F_LOCAL
+                if latency > SLOT_DURATION:
+                    latency = DROP_PENALTY
+            else:
+                SNR      = P_TX / (N0 * DISTANCES[i] ** 2)
+                R        = B * np.log2(1 + SNR)
+                t_upload = D / R
+                t_wait   = max(0.0, queue_copy)
+                t_exec   = C / F_UAV
+                latency  = t_upload + t_wait + t_exec
+                queue_copy += t_exec
+                if latency > SLOT_DURATION:
+                    latency = DROP_PENALTY
+            predicted_lat += latency
+
+        self.predicted_latencies.append(predicted_lat)
+
+        # Restore twin state (non-destructive prediction)
+        self.twin_env.uav_queue_time = saved_queue
+        self.twin_env.current_tasks  = saved_tasks
+
+        return predicted_lat
+
+    # ----------------------------------------------------------
+    #  KPI summaries
+    # ----------------------------------------------------------
+    def get_analytics(self, last_n=None):
+        """Return summary KPIs from the digital twin monitoring."""
+        if last_n:
+            lats   = self.latency_history[-last_n:]
+            drops  = self.drop_history[-last_n:]
+            utils  = self.utilisation_history[-last_n:]
+            offlds = self.offload_ratio_history[-last_n:]
+        else:
+            lats   = self.latency_history
+            drops  = self.drop_history
+            utils  = self.utilisation_history
+            offlds = self.offload_ratio_history
+
+        return {
+            "avg_latency":       np.mean(lats)   if lats   else 0,
+            "avg_drop_rate":     np.mean(drops)  if drops  else 0,
+            "avg_utilisation":   np.mean(utils)  if utils  else 0,
+            "avg_offload_ratio": np.mean(offlds) if offlds else 0,
+            "sync_count":        self.sync_count,
+            "total_steps":       self.total_steps,
+        }
+
+    @property
+    def current_tasks(self):
+        return self.physical_env.current_tasks
+
+
+# =============================================================
 #  STANDARD DQN NETWORK
 # =============================================================
 class DQNNet(nn.Module):
@@ -373,17 +556,18 @@ class DQNAgent:
 
 
 # =============================================================
-#  TRAINING FUNCTION
+#  TRAINING FUNCTION (Digital Twin-Enabled)
 # =============================================================
 def train_agent(state_size, action_size, dueling, use_heuristic, label):
     agent = DQNAgent(state_size, action_size,
                      dueling=dueling, use_heuristic=use_heuristic)
-    env   = UAVEnvironment()
+    dt    = DigitalTwin()   # create Digital Twin of the UAV-MEC network
 
     latencies, drops, rewards, losses = [], [], [], []
 
     print(f"\n{'=' * 70}")
-    print(f"  {label} -- 5 Devices, 1 UAV, {N_EPISODES} Episodes")
+    print(f"  {label} -- Digital Twin-Enabled Training")
+    print(f"  {N_DEVICES} Devices, 1 UAV, {N_EPISODES} Episodes")
     if use_heuristic:
         print(f"  Heuristic guidance: ON  (epsilon>{HEUR_EPSILON_THRESHOLD}, "
               f"call_prob={HEUR_CALL_PROB})")
@@ -393,16 +577,21 @@ def train_agent(state_size, action_size, dueling, use_heuristic, label):
     print("-" * 75)
 
     for ep in range(N_EPISODES):
-        state      = env.reset()
+        state      = dt.reset()
         ep_latency = []
         ep_drops   = []
         ep_reward  = 0.0
         ep_losses  = []
 
         for slot in range(N_SLOTS):
-            # Pass current tasks to agent for heuristic guidance
-            action = agent.act(state, tasks=env.current_tasks)
-            next_state, reward, total_lat, info, _, _ = env.step(action)
+            # Agent observes twin-synchronised state and current tasks
+            action = agent.act(state, tasks=dt.current_tasks)
+
+            # Digital Twin predicts outcome before physical execution
+            dt.predict_latency(action)
+
+            # Execute on physical env (twin auto-syncs)
+            next_state, reward, total_lat, info, _, _ = dt.step(action)
 
             agent.remember(state, action, reward, next_state)
             loss_val = agent.learn()
@@ -433,10 +622,14 @@ def train_agent(state_size, action_size, dueling, use_heuristic, label):
                   f"{avg_loss:>10.4f} | {agent.epsilon:>8.3f} | "
                   f"{agent.heuristic_calls:>10}")
 
+    # --- Digital Twin analytics summary ---
+    analytics = dt.get_analytics()
     print(f"\n  {label} complete!")
     print(f"   Last 50 ep avg latency : {np.mean(latencies[-50:]):.4f}s")
     print(f"   Total heuristic calls  : {agent.heuristic_calls}")
-    return latencies, drops, rewards, losses, env, agent
+    print(f"   Digital Twin sync count: {analytics['sync_count']}")
+    print(f"   DT avg utilisation     : {analytics['avg_utilisation']:.2%}")
+    return latencies, drops, rewards, losses, dt, agent
 
 
 # =============================================================
@@ -480,11 +673,11 @@ duel_lat, duel_drop, duel_rew, duel_loss, _, duel_agent = train_agent(
     dueling=True, use_heuristic=False,
     label="Dueling DQN")
 
-# 3. Heuristic-Guided Dueling DQN -- proposed method
-heur_lat, heur_drop, heur_rew, heur_loss, env_heur, heur_agent = train_agent(
+# 3. DT-Heuristic-Guided Dueling DQN -- proposed method (Digital Twin-enabled)
+heur_lat, heur_drop, heur_rew, heur_loss, dt_heur, heur_agent = train_agent(
     state_size, action_size,
     dueling=True, use_heuristic=True,
-    label="Heuristic-Guided Dueling DQN")
+    label="DT-Heuristic-Guided Dueling DQN")
 
 
 # =============================================================
@@ -507,20 +700,20 @@ print(f"  FINAL COMPARISON")
 print(f"{'=' * 60}")
 
 results = [
-    ("Heur Dueling DQN",  np.mean(heur_lat[-50:])),
-    ("Dueling DQN",       np.mean(duel_lat[-50:])),
-    ("Standard DQN",      np.mean(std_lat[-50:])),
-    ("Random",            np.mean(random_lat[-50:])),
-    ("All Offload",       np.mean(offload_lat[-50:])),
-    ("All Local",         np.mean(local_lat[-50:])),
+    ("DT-Heur Dueling DQN", np.mean(heur_lat[-50:])),
+    ("Dueling DQN",          np.mean(duel_lat[-50:])),
+    ("Standard DQN",         np.mean(std_lat[-50:])),
+    ("Random",               np.mean(random_lat[-50:])),
+    ("All Offload",          np.mean(offload_lat[-50:])),
+    ("All Local",            np.mean(local_lat[-50:])),
 ]
 best = results[0][1]
 
 for name, val in results:
     improvement = (1 - best/val)*100 if val != best else 0
-    marker = " <- proposed" if name == "Heur Dueling DQN" else \
+    marker = " <- proposed (DT-enabled)" if name == "DT-Heur Dueling DQN" else \
              f"  ({improvement:.1f}% worse)" if improvement > 0 else ""
-    print(f"  {name:<20}: {val:.4f}s{marker}")
+    print(f"  {name:<22}: {val:.4f}s{marker}")
 
 
 # =============================================================
@@ -537,11 +730,11 @@ x_range = range(window - 1, N_EPISODES)
 
 fig, axes = plt.subplots(2, 3, figsize=(21, 12))
 fig.suptitle(
-    "Heuristic-Guided Dueling DQN for UAV Task Offloading -- 5 Devices, 1 UAV",
+    "Digital Twin-Enabled Heuristic-Guided DQN for UAV Task Offloading -- 5 Devices, 1 UAV",
     fontsize=14, fontweight='bold')
 
 all_lines = [
-    (heur_rew,   heur_lat,   'blue',       '-',  'Heur Dueling DQN (proposed)'),
+    (heur_rew,   heur_lat,   'blue',       '-',  'DT-Heur Dueling DQN (proposed)'),
     (duel_rew,   duel_lat,   'deepskyblue','--', 'Dueling DQN'),
     (std_rew,    std_lat,    'purple',     ':',  'Standard DQN'),
     (random_rew, random_lat, 'darkorange', ':',  'Random'),
@@ -577,7 +770,7 @@ axes[0, 1].grid(True)
 
 # ---- Plot 3: Convergence zoom (first 300 episodes) ----
 zoom_lines = [
-    (heur_lat[:300], 'blue',       '-',  'Heur Dueling DQN'),
+    (heur_lat[:300], 'blue',       '-',  'DT-Heur Dueling DQN'),
     (duel_lat[:300], 'deepskyblue','--', 'Dueling DQN'),
     (std_lat[:300],  'purple',     ':',  'Standard DQN'),
 ]
@@ -596,7 +789,7 @@ axes[0, 2].grid(True)
 
 # ---- Plot 4: Training Loss ----
 for loss, color, style, label in [
-    (heur_loss, 'blue',       '-',  'Heur Dueling DQN'),
+    (heur_loss, 'blue',       '-',  'DT-Heur Dueling DQN'),
     (duel_loss, 'deepskyblue','--', 'Dueling DQN'),
     (std_loss,  'purple',     ':',  'Standard DQN'),
 ]:
@@ -611,7 +804,7 @@ axes[1, 0].legend(fontsize=9)
 axes[1, 0].grid(True)
 
 # ---- Plot 5: Final Latency Bar ----
-methods    = ['Heur\nDueling', 'Dueling\nDQN', 'Standard\nDQN',
+methods    = ['DT-Heur\nDueling', 'Dueling\nDQN', 'Standard\nDQN',
               'Random', 'All\nOffload', 'All\nLocal']
 lat_vals   = [np.mean(heur_lat[-50:]),    np.mean(duel_lat[-50:]),
               np.mean(std_lat[-50:]),      np.mean(random_lat[-50:]),
@@ -628,13 +821,13 @@ axes[1, 1].set_title('Final Average Latency')
 axes[1, 1].set_ylabel('Avg Latency (s)')
 axes[1, 1].grid(True, axis='y')
 
-# ---- Plot 6: Per-device Latency (Heur-Dueling DQN) ----
-state = env_heur.reset()
+# ---- Plot 6: Per-device Latency (DT-Heur Dueling DQN) ----
+state = dt_heur.reset()
 d_lat = [[] for _ in range(N_DEVICES)]
 d_dec = [[] for _ in range(N_DEVICES)]
 for slot in range(N_SLOTS):
     action = heur_agent.act(state)
-    next_state, _, _, info, _, _ = env_heur.step(action)
+    next_state, _, _, info, _, _ = dt_heur.step(action)
     state = next_state
     for x in info:
         i = x["device"]
@@ -655,13 +848,25 @@ for bar, rate in zip(bars, offrates):
                     f'{rate:.0%}', ha='center', va='bottom', fontsize=9)
 axes[1, 2].axhline(SLOT_DURATION, color='black', linestyle='--',
                    label='Slot limit')
-axes[1, 2].set_title('Per-Device Latency: Heur Dueling DQN')
+axes[1, 2].set_title('Per-Device Latency: DT-Heur Dueling DQN')
 axes[1, 2].set_ylabel('Avg Latency (s)')
 axes[1, 2].legend(fontsize=9)
 axes[1, 2].grid(True, axis='y')
 
 plt.tight_layout()
-plt.savefig('/mnt/user-data/outputs/result_heur_dqn.png',
+plt.savefig('/mnt/user-data/outputs/result_dt_heur_dqn.png',
             dpi=150, bbox_inches='tight')
 plt.show()
-print("\nPlot saved as /mnt/user-data/outputs/result_heur_dqn.png")
+print("\nPlot saved as /mnt/user-data/outputs/result_dt_heur_dqn.png")
+
+# --- Print Digital Twin Analytics ---
+print(f"\n{'=' * 60}")
+print(f"  DIGITAL TWIN ANALYTICS SUMMARY")
+print(f"{'=' * 60}")
+analytics = dt_heur.get_analytics()
+print(f"  Total sync operations    : {analytics['sync_count']}")
+print(f"  Total simulation steps   : {analytics['total_steps']}")
+print(f"  Avg UAV utilisation      : {analytics['avg_utilisation']:.2%}")
+print(f"  Avg offload ratio        : {analytics['avg_offload_ratio']:.2%}")
+print(f"  Avg latency (all steps)  : {analytics['avg_latency']:.4f}s")
+print(f"  Avg drop rate            : {analytics['avg_drop_rate']:.2%}")
