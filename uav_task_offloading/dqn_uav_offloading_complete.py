@@ -3,8 +3,8 @@
 ================================================================================
 ATTENTION-ENHANCED HEURISTIC-GUIDED DQN FOR UAV TASK OFFLOADING
 ================================================================================
-Compares Standard DQN vs Dueling DQN vs Heuristic-Guided Dueling DQN
-vs Attention-Enhanced Heuristic Dueling DQN (proposed)
+Compares Standard DQN vs Heuristic-Guided DQN
+vs Attention-Enhanced Heuristic DQN (proposed)
 for binary task offloading in UAV-assisted edge computing networks.
 To run: python dqn_uav_offloading_complete.py
 Dependencies: pip install numpy matplotlib torch
@@ -228,38 +228,11 @@ class DQNNet(nn.Module):
     def forward(self, x):
         return self.net(x)
 # =============================================================
-#  DUELING DQN NETWORK
+#  ATTENTION-ENHANCED DQN NETWORK  (proposed)
 # =============================================================
-class DuelingDQNNet(nn.Module):
-    def __init__(self, state_size, action_size):
-        super().__init__()
-        self.feature = nn.Sequential(
-            nn.Linear(state_size, 512),
-            nn.ReLU(),
-            nn.Linear(512, 512),
-            nn.ReLU(),
-        )
-        self.value_stream = nn.Sequential(
-            nn.Linear(512, 256),
-            nn.ReLU(),
-            nn.Linear(256, 1)
-        )
-        self.advantage_stream = nn.Sequential(
-            nn.Linear(512, 256),
-            nn.ReLU(),
-            nn.Linear(256, action_size)
-        )
-    def forward(self, x):
-        f = self.feature(x)
-        v = self.value_stream(f)
-        a = self.advantage_stream(f)
-        return v + (a - a.mean(dim=1, keepdim=True))
-# =============================================================
-#  ATTENTION-ENHANCED DUELING DQN NETWORK  (proposed)
-# =============================================================
-class AttentionDuelingDQNNet(nn.Module):
+class AttentionDQNNet(nn.Module):
     """
-    Dueling DQN whose feature extractor uses Multi-Head Self-Attention
+    DQN whose feature extractor uses Multi-Head Self-Attention
     over per-device token embeddings.  Each device's 4-dim state vector
     (data_size, cpu_cycles, distance, has_task) is projected into an
     embedding, positional-encoded, then fed through a Transformer-style
@@ -271,9 +244,9 @@ class AttentionDuelingDQNNet(nn.Module):
         state (41-d) -> split into 10 device tokens (4-d each) + 1 global (queue)
                      -> Linear projection to d_model
                      -> + learned positional encoding
-                     -> Multi-Head Self-Attention (2 heads, 2 layers)
+                     -> Multi-Head Self-Attention (2 heads, 1 layer)
                      -> concat attentive features + global queue
-                     -> Dueling value / advantage streams -> Q-values
+                     -> FC layers -> Q-values
     """
     FEATURES_PER_DEVICE = 4   # (data_size, cpu_cycles, distance, has_task)
 
@@ -302,19 +275,14 @@ class AttentionDuelingDQNNet(nn.Module):
         # --- Global queue feature projection ---
         self.queue_proj = nn.Linear(1, d_model)
 
-        # --- Merge: attention features + queue -> shared representation ---
+        # --- Merge: attention features + queue -> Q-values ---
         merge_dim = d_model * self.n_devices + d_model
-        self.merge = nn.Sequential(
+        self.net = nn.Sequential(
             nn.Linear(merge_dim, 512),
             nn.ReLU(),
-        )
-
-        # --- Dueling streams ---
-        self.value_stream = nn.Sequential(
-            nn.Linear(512, 256), nn.ReLU(), nn.Linear(256, 1)
-        )
-        self.advantage_stream = nn.Sequential(
-            nn.Linear(512, 256), nn.ReLU(), nn.Linear(256, action_size)
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Linear(256, action_size),
         )
 
         # For extracting attention weights during visualisation
@@ -344,13 +312,8 @@ class AttentionDuelingDQNNet(nn.Module):
         # Queue embedding
         queue_emb = self.queue_proj(queue_feat)          # (batch, d_model)
 
-        # Merge
-        merged = self.merge(torch.cat([attn_flat, queue_emb], dim=1))
-
-        # Dueling
-        v = self.value_stream(merged)
-        a = self.advantage_stream(merged)
-        q = v + (a - a.mean(dim=1, keepdim=True))
+        # Q-values
+        q = self.net(torch.cat([attn_flat, queue_emb], dim=1))
 
         return q
 
@@ -370,10 +333,10 @@ class AttentionDuelingDQNNet(nn.Module):
         return x, avg_w
 
 # =============================================================
-#  GENERIC AGENT -- Standard or Dueling, with optional Heuristic
+#  GENERIC AGENT -- Standard DQN with optional Heuristic/Attention
 # =============================================================
 class DQNAgent:
-    def __init__(self, state_size, action_size, dueling=False,
+    def __init__(self, state_size, action_size,
                  use_heuristic=False, use_attention=False):
         self.state_size      = state_size
         self.action_size     = action_size
@@ -389,9 +352,7 @@ class DQNAgent:
         self.lr            = 0.0003
         self.tau           = 0.005
         if use_attention:
-            NetClass = AttentionDuelingDQNNet
-        elif dueling:
-            NetClass = DuelingDQNNet
+            NetClass = AttentionDQNNet
         else:
             NetClass = DQNNet
         self.model        = NetClass(state_size, action_size)
@@ -462,14 +423,14 @@ def warmup_with_heuristic(agent, warmup_steps):
 # =============================================================
 #  TRAINING FUNCTION
 # =============================================================
-def train_agent(state_size, action_size, dueling, use_heuristic, label,
+def train_agent(state_size, action_size, use_heuristic, label,
                 use_attention=False):
     # Reset seeds before each agent for fair comparison
     random.seed(SEED)
     np.random.seed(SEED)
     torch.manual_seed(SEED)
     agent = DQNAgent(state_size, action_size,
-                     dueling=dueling, use_heuristic=use_heuristic,
+                     use_heuristic=use_heuristic,
                      use_attention=use_attention)
     env   = UAVEnvironment()
     if use_heuristic:
@@ -553,23 +514,18 @@ print(f"Device distances: {[f'{d:.0f}m' for d in DISTANCES]}")
 # 1. Standard DQN
 std_lat,  std_drop,  std_rew,  std_loss,  _, std_agent  = train_agent(
     state_size, action_size,
-    dueling=False, use_heuristic=False,
+    use_heuristic=False,
     label="Standard DQN")
-# 2. Dueling DQN
-duel_lat, duel_drop, duel_rew, duel_loss, _, duel_agent = train_agent(
-    state_size, action_size,
-    dueling=True, use_heuristic=False,
-    label="Dueling DQN")
-# 3. Heuristic-Guided Dueling DQN
+# 2. Heuristic-Guided DQN
 heur_lat, heur_drop, heur_rew, heur_loss, env_heur, heur_agent = train_agent(
     state_size, action_size,
-    dueling=True, use_heuristic=True,
-    label="Heuristic-Guided Dueling DQN")
-# 4. Attention-Enhanced Heuristic Dueling DQN -- proposed method
+    use_heuristic=True,
+    label="Heuristic-Guided DQN")
+# 3. Attention-Enhanced Heuristic DQN -- proposed method
 attn_lat, attn_drop, attn_rew, attn_loss, env_attn, attn_agent = train_agent(
     state_size, action_size,
-    dueling=True, use_heuristic=True, use_attention=True,
-    label="Attention-Enhanced Heur Dueling DQN")
+    use_heuristic=True, use_attention=True,
+    label="Attention-Enhanced Heuristic DQN")
 # =============================================================
 #  BASELINES
 # =============================================================
@@ -590,9 +546,8 @@ print(f"\n{'=' * 60}")
 print(f"  CONVERGENCE SPEED")
 print(f"{'=' * 60}")
 target_lat = np.mean(attn_lat[-50:]) * 1.05
-for name, lat in [("Attn Heur Dueling DQN", attn_lat),
-                  ("Heur Dueling DQN", heur_lat),
-                  ("Dueling DQN", duel_lat),
+for name, lat in [("Attn Heur DQN", attn_lat),
+                  ("Heur DQN", heur_lat),
                   ("Standard DQN", std_lat)]:
     smoothed = moving_avg(lat, window)
     converged = [i for i, l in enumerate(smoothed) if l < target_lat]
@@ -607,9 +562,8 @@ print(f"\n{'=' * 60}")
 print(f"  FINAL COMPARISON  ({N_DEVICES} devices, {action_size} actions)")
 print(f"{'=' * 60}")
 results = [
-    ("Attn Heur Dueling",  np.mean(attn_lat[-50:])),
-    ("Heur Dueling DQN",   np.mean(heur_lat[-50:])),
-    ("Dueling DQN",        np.mean(duel_lat[-50:])),
+    ("Attn Heur DQN",      np.mean(attn_lat[-50:])),
+    ("Heur DQN",           np.mean(heur_lat[-50:])),
     ("Standard DQN",       np.mean(std_lat[-50:])),
     ("Random",             np.mean(random_lat[-50:])),
     ("All Offload",        np.mean(offload_lat[-50:])),
@@ -618,7 +572,7 @@ results = [
 best = results[0][1]
 for name, val in results:
     improvement = (1 - best/val)*100 if val != best else 0
-    marker = " <- proposed (attention)" if name == "Attn Heur Dueling" else \
+    marker = " <- proposed (attention)" if name == "Attn Heur DQN" else \
              f"  ({improvement:.1f}% worse)" if improvement > 0 else ""
     print(f"  {name:<22}: {val:.4f}s{marker}")
 # =============================================================
@@ -626,14 +580,13 @@ for name, val in results:
 # =============================================================
 os.makedirs('/mnt/user-data/outputs', exist_ok=True)
 x_range = range(window - 1, N_EPISODES)
-fig, axes = plt.subplots(2, 4, figsize=(28, 12))
+fig, axes = plt.subplots(2, 3, figsize=(22, 12))
 fig.suptitle(
     f"Attention-Enhanced Heuristic DQN for UAV Task Offloading -- {N_DEVICES} Devices, 1 UAV",
     fontsize=14, fontweight='bold')
 all_lines = [
-    (attn_rew,   attn_lat,   'crimson',    '-',  'Attn Heur Dueling DQN (proposed)'),
-    (heur_rew,   heur_lat,   'blue',       '-.',  'Heur Dueling DQN'),
-    (duel_rew,   duel_lat,   'deepskyblue','--', 'Dueling DQN'),
+    (attn_rew,   attn_lat,   'crimson',    '-',  'Attention Heur DQN (proposed)'),
+    (heur_rew,   heur_lat,   'blue',       '-.',  'Heuristic-Guided DQN'),
     (std_rew,    std_lat,    'purple',     ':',  'Standard DQN'),
     (random_rew, random_lat, 'darkorange', ':',  'Random'),
     (offload_rew,offload_lat,'green',      '-.', 'All Offload'),
@@ -666,9 +619,8 @@ axes[0, 1].grid(True)
 # ---- Plot 3: Convergence zoom (first 400 episodes) ----
 zoom_ep = 400
 zoom_lines = [
-    (attn_lat[:zoom_ep], 'crimson',    '-',  'Attn Heur Dueling DQN'),
-    (heur_lat[:zoom_ep], 'blue',       '-.',  'Heur Dueling DQN'),
-    (duel_lat[:zoom_ep], 'deepskyblue','--', 'Dueling DQN'),
+    (attn_lat[:zoom_ep], 'crimson',    '-',  'Attention Heur DQN'),
+    (heur_lat[:zoom_ep], 'blue',       '-.',  'Heuristic-Guided DQN'),
     (std_lat[:zoom_ep],  'purple',     ':',  'Standard DQN'),
 ]
 for lat, color, style, label in zoom_lines:
@@ -683,28 +635,10 @@ axes[0, 2].set_xlabel('Episode')
 axes[0, 2].set_ylabel('Avg Latency (s)')
 axes[0, 2].legend(fontsize=8)
 axes[0, 2].grid(True)
-# ---- Plot 4: Drop Rate ----
-drop_lines = [
-    (attn_drop, 'crimson',    '-',  'Attn Heur Dueling DQN'),
-    (heur_drop, 'blue',       '-.',  'Heur Dueling DQN'),
-    (duel_drop, 'deepskyblue','--', 'Dueling DQN'),
-    (std_drop,  'purple',     ':',  'Standard DQN'),
-]
-for drop, color, style, label in drop_lines:
-    axes[0, 3].plot(drop, alpha=0.15, color=color)
-    axes[0, 3].plot(x_range, moving_avg(drop, window),
-                    color=color, linewidth=2.5,
-                    linestyle=style, label=label)
-axes[0, 3].set_title('Task Drop Rate')
-axes[0, 3].set_xlabel('Episode')
-axes[0, 3].set_ylabel('Drop Rate')
-axes[0, 3].legend(fontsize=8)
-axes[0, 3].grid(True)
-# ---- Plot 5: Training Loss ----
+# ---- Plot 4: Training Loss ----
 for loss, color, style, label in [
-    (attn_loss, 'crimson',    '-',  'Attn Heur Dueling DQN'),
-    (heur_loss, 'blue',       '-.',  'Heur Dueling DQN'),
-    (duel_loss, 'deepskyblue','--', 'Dueling DQN'),
+    (attn_loss, 'crimson',    '-',  'Attention Heur DQN'),
+    (heur_loss, 'blue',       '-.',  'Heuristic-Guided DQN'),
     (std_loss,  'purple',     ':',  'Standard DQN'),
 ]:
     axes[1, 0].plot(loss, alpha=0.15, color=color)
@@ -716,14 +650,14 @@ axes[1, 0].set_xlabel('Episode')
 axes[1, 0].set_ylabel('Huber Loss')
 axes[1, 0].legend(fontsize=8)
 axes[1, 0].grid(True)
-# ---- Plot 6: Final Latency Bar ----
-methods    = ['Attn Heur\nDueling', 'Heur\nDueling', 'Dueling\nDQN',
+# ---- Plot 5: Final Latency Bar ----
+methods    = ['Attn Heur\nDQN', 'Heur\nDQN',
               'Standard\nDQN', 'Random', 'All\nOffload', 'All\nLocal']
 lat_vals   = [np.mean(attn_lat[-50:]),    np.mean(heur_lat[-50:]),
-              np.mean(duel_lat[-50:]),     np.mean(std_lat[-50:]),
+              np.mean(std_lat[-50:]),
               np.mean(random_lat[-50:]),
               np.mean(offload_lat[-50:]),  np.mean(local_lat[-50:])]
-bar_colors = ['crimson', 'blue', 'deepskyblue', 'purple',
+bar_colors = ['crimson', 'blue', 'purple',
               'darkorange', 'green', 'red']
 bars = axes[1, 1].bar(methods, lat_vals, color=bar_colors,
                       edgecolor='black', linewidth=0.8)
@@ -734,40 +668,7 @@ for bar, val in zip(bars, lat_vals):
 axes[1, 1].set_title('Final Average Latency (Last 50 Episodes)')
 axes[1, 1].set_ylabel('Avg Latency (s)')
 axes[1, 1].grid(True, axis='y')
-# ---- Plot 7: Per-device Latency (Attn-Heur-Dueling DQN) ----
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-state = env_attn.reset()
-d_lat = [[] for _ in range(N_DEVICES)]
-d_dec = [[] for _ in range(N_DEVICES)]
-for slot in range(N_SLOTS):
-    action = attn_agent.act(state)
-    next_state, _, _, info, _, _ = env_attn.step(action)
-    state = next_state
-    for x in info:
-        i = x["device"]
-        if x["action"] != "no task":
-            d_lat[i].append(x["latency"])
-            d_dec[i].append(1 if x["action"] == "offload" else 0)
-labels   = [f"D{i}\n({DISTANCES[i]:.0f}m)" for i in range(N_DEVICES)]
-avgs     = [np.mean(d_lat[i]) if d_lat[i] else 0 for i in range(N_DEVICES)]
-offrates = [np.mean(d_dec[i]) if d_dec[i] else 0 for i in range(N_DEVICES)]
-dev_colors = ['#2ecc71','#3498db','#e74c3c','#f39c12','#9b59b6',
-              '#1abc9c','#e67e22','#34495e','#27ae60','#c0392b']
-bars = axes[1, 2].bar(labels, avgs, color=dev_colors,
-                      edgecolor='black', linewidth=0.8)
-for bar, rate in zip(bars, offrates):
-    axes[1, 2].text(bar.get_x() + bar.get_width()/2,
-                    bar.get_height() + 0.001,
-                    f'{rate:.0%}', ha='center', va='bottom', fontsize=7)
-axes[1, 2].axhline(SLOT_DURATION, color='black', linestyle='--',
-                   label='Slot limit')
-axes[1, 2].set_title('Per-Device Latency: Attn Heur Dueling DQN')
-axes[1, 2].set_ylabel('Avg Latency (s)')
-axes[1, 2].legend(fontsize=8)
-axes[1, 2].grid(True, axis='y')
-# ---- Plot 8: Attention Heatmap ----
+# ---- Plot 6: Attention Heatmap ----
 # Extract learned attention weights from the proposed model
 random.seed(SEED)
 np.random.seed(SEED)
@@ -777,23 +678,23 @@ with torch.no_grad():
     _ = attn_agent.model(state_t, return_attention=True)
     attn_weights = attn_agent.model._attn_weights.squeeze(0).numpy()
 dev_labels = [f"D{i}" for i in range(N_DEVICES)]
-im = axes[1, 3].imshow(attn_weights, cmap='YlOrRd', aspect='equal',
+im = axes[1, 2].imshow(attn_weights, cmap='YlOrRd', aspect='equal',
                        vmin=0, vmax=attn_weights.max())
-axes[1, 3].set_xticks(range(N_DEVICES))
-axes[1, 3].set_yticks(range(N_DEVICES))
-axes[1, 3].set_xticklabels(dev_labels, fontsize=8)
-axes[1, 3].set_yticklabels(dev_labels, fontsize=8)
-axes[1, 3].set_xlabel('Key Device')
-axes[1, 3].set_ylabel('Query Device')
-axes[1, 3].set_title('Learned Device Attention Weights')
+axes[1, 2].set_xticks(range(N_DEVICES))
+axes[1, 2].set_yticks(range(N_DEVICES))
+axes[1, 2].set_xticklabels(dev_labels, fontsize=8)
+axes[1, 2].set_yticklabels(dev_labels, fontsize=8)
+axes[1, 2].set_xlabel('Key Device')
+axes[1, 2].set_ylabel('Query Device')
+axes[1, 2].set_title('Learned Device Attention Weights')
 # Annotate cells
 for ii in range(N_DEVICES):
     for jj in range(N_DEVICES):
-        axes[1, 3].text(jj, ii, f'{attn_weights[ii, jj]:.2f}',
+        axes[1, 2].text(jj, ii, f'{attn_weights[ii, jj]:.2f}',
                         ha='center', va='center', fontsize=6,
                         color='white' if attn_weights[ii, jj] > attn_weights.max()*0.6
                         else 'black')
-plt.colorbar(im, ax=axes[1, 3], fraction=0.046, pad=0.04)
+plt.colorbar(im, ax=axes[1, 2], fraction=0.046, pad=0.04)
 plt.tight_layout()
 plt.savefig('/mnt/user-data/outputs/result_attn_heur_dqn.png',
             dpi=150, bbox_inches='tight')
