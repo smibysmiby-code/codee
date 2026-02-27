@@ -29,7 +29,8 @@ KEY FEATURES:
 6. Larger replay buffer for better sample diversity
 7. Huber loss for robust training
 8. Cost-based heuristic-guided exploration for faster early convergence
-9. Digital Twin analytics: latency prediction, resource monitoring, what-if analysis
+9. DT-assisted action refinement: top-K Q-value candidates evaluated via twin
+10. Digital Twin analytics: latency prediction, resource monitoring, what-if analysis
 ================================================================================
 """
 
@@ -77,9 +78,12 @@ DROP_PENALTY = 0.15
 DISTANCES    = [np.linalg.norm(UAV_POS - dp) for dp in DEVICE_POSITIONS]
 
 # Heuristic guidance settings
-HEUR_EPSILON_THRESHOLD = 0.4   # only use heuristic when epsilon > 0.4 (early training)
-HEUR_CALL_PROB         = 0.25  # 25% of exploration steps use heuristic (rest random)
+HEUR_EPSILON_THRESHOLD = 0.5   # use heuristic when epsilon > 0.5 (longer guidance window)
+HEUR_CALL_PROB         = 0.45  # 45% of exploration steps use heuristic (rest random)
 HEUR_NOISE_PROB        = 0.10  # 10% chance to flip each device decision (diversity)
+
+# DT-assisted action refinement settings
+DT_TOP_K               = 6    # evaluate top-K Q-value actions via twin simulation
 
 
 # =============================================================
@@ -385,6 +389,44 @@ class DigitalTwin:
         return predicted_lat
 
     # ----------------------------------------------------------
+    #  Lightweight action simulation (no side effects)
+    # ----------------------------------------------------------
+    def simulate_action(self, action):
+        """
+        Evaluate a candidate action on the twin WITHOUT modifying state.
+        Returns the predicted total latency.  Used by DT-assisted
+        action refinement to pick the best among top-K Q-value actions.
+        """
+        tasks = self.twin_env.current_tasks
+        queue_copy = self.twin_env.uav_queue_time
+
+        decisions = [(action >> i) & 1 for i in range(N_DEVICES)]
+        total_lat = 0.0
+
+        for i in range(N_DEVICES):
+            if tasks[i] is None:
+                continue
+            D, C = tasks[i]
+
+            if decisions[i] == 0:
+                latency = C / F_LOCAL
+                if latency > SLOT_DURATION:
+                    latency = DROP_PENALTY
+            else:
+                SNR      = P_TX / (N0 * DISTANCES[i] ** 2)
+                R        = B * np.log2(1 + SNR)
+                t_upload = D / R
+                t_wait   = max(0.0, queue_copy)
+                t_exec   = C / F_UAV
+                latency  = t_upload + t_wait + t_exec
+                queue_copy += t_exec
+                if latency > SLOT_DURATION:
+                    latency = DROP_PENALTY
+            total_lat += latency
+
+        return total_lat
+
+    # ----------------------------------------------------------
     #  KPI summaries
     # ----------------------------------------------------------
     def get_analytics(self, last_n=None):
@@ -464,11 +506,14 @@ class DuelingDQNNet(nn.Module):
 #  GENERIC AGENT -- Standard or Dueling, with optional Heuristic
 # =============================================================
 class DQNAgent:
-    def __init__(self, state_size, action_size, dueling=False, use_heuristic=False):
+    def __init__(self, state_size, action_size, dueling=False,
+                 use_heuristic=False, digital_twin=None):
         self.state_size      = state_size
         self.action_size     = action_size
         self.use_heuristic   = use_heuristic
+        self.digital_twin    = digital_twin   # DT reference for action refinement
         self.heuristic_calls = 0
+        self.dt_refinements  = 0
         self.memory        = deque(maxlen=20000)
         self.batch_size    = 64
         self.gamma         = 0.95
@@ -495,13 +540,18 @@ class DQNAgent:
 
     def act(self, state, tasks=None):
         """
-        Heuristic-guided epsilon-greedy:
-          - epsilon > HEUR_EPSILON_THRESHOLD AND random < HEUR_CALL_PROB
-            -> use cost-based heuristic for smart action
-          - else if random < epsilon
-            -> random action
-          - else
-            -> greedy from Q-network
+        Heuristic-guided epsilon-greedy with DT-assisted exploitation:
+
+        EXPLORATION (random < epsilon):
+          - If heuristic enabled & epsilon high: use cost-based heuristic
+          - Otherwise: random action
+
+        EXPLOITATION (random >= epsilon):
+          - If digital twin available: get top-K actions by Q-value,
+            simulate each in the DT, pick the one with lowest predicted
+            latency.  This is the key DT advantage -- the twin refines
+            the Q-network's decisions using exact cost computation.
+          - Otherwise: standard argmax Q
         """
         if random.random() < self.epsilon:
             # Exploration phase
@@ -514,10 +564,27 @@ class DQNAgent:
             else:
                 return random.randrange(self.action_size)
         else:
-            # Exploitation: use Q-network
+            # Exploitation phase
             with torch.no_grad():
-                q = self.model(torch.FloatTensor(state).unsqueeze(0))
-            return q.argmax().item()
+                q = self.model(torch.FloatTensor(state).unsqueeze(0)).squeeze()
+
+            if self.digital_twin is not None:
+                # DT-Assisted Action Refinement:
+                # Q-network shortlists top-K candidates, twin picks the best
+                top_k = min(DT_TOP_K, self.action_size)
+                top_actions = q.topk(top_k).indices.tolist()
+
+                best_action = top_actions[0]
+                best_cost   = float('inf')
+                for a in top_actions:
+                    cost = self.digital_twin.simulate_action(a)
+                    if cost < best_cost:
+                        best_cost   = cost
+                        best_action = a
+                self.dt_refinements += 1
+                return best_action
+            else:
+                return q.argmax().item()
 
     def remember(self, s, a, r, s2):
         self.memory.append((s, a, r, s2))
@@ -559,9 +626,10 @@ class DQNAgent:
 #  TRAINING FUNCTION (Digital Twin-Enabled)
 # =============================================================
 def train_agent(state_size, action_size, dueling, use_heuristic, label):
-    agent = DQNAgent(state_size, action_size,
-                     dueling=dueling, use_heuristic=use_heuristic)
     dt    = DigitalTwin()   # create Digital Twin of the UAV-MEC network
+    agent = DQNAgent(state_size, action_size,
+                     dueling=dueling, use_heuristic=use_heuristic,
+                     digital_twin=dt if use_heuristic else None)
 
     latencies, drops, rewards, losses = [], [], [], []
 
@@ -573,8 +641,8 @@ def train_agent(state_size, action_size, dueling, use_heuristic, label):
               f"call_prob={HEUR_CALL_PROB})")
     print(f"{'=' * 70}")
     print(f"{'Episode':>8} | {'Avg Latency':>12} | {'Drop Rate':>10} | "
-          f"{'Avg Loss':>10} | {'Epsilon':>8} | {'Heur calls':>10}")
-    print("-" * 75)
+          f"{'Avg Loss':>10} | {'Epsilon':>8} | {'Heur':>6} | {'DT ref':>7}")
+    print("-" * 80)
 
     for ep in range(N_EPISODES):
         state      = dt.reset()
@@ -620,13 +688,14 @@ def train_agent(state_size, action_size, dueling, use_heuristic, label):
         if ep % 50 == 0:
             print(f"{ep:>8} | {avg_lat:>12.4f}s | {avg_drop:>9.1%} | "
                   f"{avg_loss:>10.4f} | {agent.epsilon:>8.3f} | "
-                  f"{agent.heuristic_calls:>10}")
+                  f"{agent.heuristic_calls:>6} | {agent.dt_refinements:>7}")
 
     # --- Digital Twin analytics summary ---
     analytics = dt.get_analytics()
     print(f"\n  {label} complete!")
     print(f"   Last 50 ep avg latency : {np.mean(latencies[-50:]):.4f}s")
     print(f"   Total heuristic calls  : {agent.heuristic_calls}")
+    print(f"   DT action refinements  : {agent.dt_refinements}")
     print(f"   Digital Twin sync count: {analytics['sync_count']}")
     print(f"   DT avg utilisation     : {analytics['avg_utilisation']:.2%}")
     return latencies, drops, rewards, losses, dt, agent
