@@ -46,6 +46,8 @@ np.random.seed(SEED)
 torch.manual_seed(SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {DEVICE}")
 # =============================================================
 #  SYSTEM PARAMETERS
 # =============================================================
@@ -53,7 +55,7 @@ SLOT_DURATION  = 0.1
 TASK_PROB      = 0.7
 N_DEVICES      = 10
 N_SLOTS        = 300
-N_EPISODES     = 300
+N_EPISODES     = 500
 F_LOCAL        = 0.5e9
 F_UAV          = 5e9
 B              = 0.5e6
@@ -244,14 +246,14 @@ class AttentionDQNNet(nn.Module):
         state (41-d) -> split into 10 device tokens (4-d each) + 1 global (queue)
                      -> Linear projection to d_model
                      -> + learned positional encoding
-                     -> Multi-Head Self-Attention (2 heads, 1 layer)
+                     -> Multi-Head Self-Attention (4 heads, 2 layers)
                      -> concat attentive features + global queue
                      -> FC layers -> Q-values
     """
     FEATURES_PER_DEVICE = 4   # (data_size, cpu_cycles, distance, has_task)
 
     def __init__(self, state_size, action_size,
-                 d_model=32, n_heads=2, n_layers=1, dropout=0.0):
+                 d_model=64, n_heads=4, n_layers=2, dropout=0.1):
         super().__init__()
         self.n_devices   = N_DEVICES
         self.d_model     = d_model
@@ -355,10 +357,23 @@ class DQNAgent:
             NetClass = AttentionDQNNet
         else:
             NetClass = DQNNet
-        self.model        = NetClass(state_size, action_size)
-        self.target_model = NetClass(state_size, action_size)
+        self.model        = NetClass(state_size, action_size).to(DEVICE)
+        self.target_model = NetClass(state_size, action_size).to(DEVICE)
         self.optimizer    = optim.Adam(self.model.parameters(), lr=self.lr)
         self.loss_fn      = nn.SmoothL1Loss()
+        # LR warmup + cosine decay for attention model (critical for transformers)
+        self.scheduler     = None
+        self._step_count   = 0
+        if use_attention:
+            total_steps = N_EPISODES * N_SLOTS
+            warmup_steps_lr = 50 * N_SLOTS  # 50 episodes of linear warmup
+            def lr_lambda(step):
+                if step < warmup_steps_lr:
+                    return step / max(1, warmup_steps_lr)  # linear warmup
+                progress = (step - warmup_steps_lr) / max(1, total_steps - warmup_steps_lr)
+                return 0.5 * (1.0 + math.cos(math.pi * progress))  # cosine decay
+            self.scheduler = torch.optim.lr_scheduler.LambdaLR(
+                self.optimizer, lr_lambda)
         self._hard_update_target()
     def _hard_update_target(self):
         self.target_model.load_state_dict(self.model.state_dict())
@@ -378,7 +393,7 @@ class DQNAgent:
                 return random.randrange(self.action_size)
         else:
             with torch.no_grad():
-                q = self.model(torch.FloatTensor(state).unsqueeze(0))
+                q = self.model(torch.FloatTensor(state).unsqueeze(0).to(DEVICE))
             return q.argmax().item()
     def remember(self, s, a, r, s2):
         self.memory.append((s, a, r, s2))
@@ -387,10 +402,10 @@ class DQNAgent:
             return None
         batch       = random.sample(self.memory, self.batch_size)
         s, a, r, s2 = zip(*batch)
-        s  = torch.FloatTensor(np.array(s))
-        a  = torch.LongTensor(a)
-        r  = torch.FloatTensor(r)
-        s2 = torch.FloatTensor(np.array(s2))
+        s  = torch.FloatTensor(np.array(s)).to(DEVICE)
+        a  = torch.LongTensor(a).to(DEVICE)
+        r  = torch.FloatTensor(r).to(DEVICE)
+        s2 = torch.FloatTensor(np.array(s2)).to(DEVICE)
         current_q    = self.model(s).gather(1, a.unsqueeze(1)).squeeze()
         with torch.no_grad():
             best_actions = self.model(s2).argmax(1)
@@ -402,6 +417,8 @@ class DQNAgent:
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 10.0)
         self.optimizer.step()
+        if self.scheduler is not None:
+            self.scheduler.step()
         self._soft_update_target()
         if self.epsilon > self.epsilon_min:
             self.epsilon *= self.epsilon_decay
@@ -434,7 +451,9 @@ def train_agent(state_size, action_size, use_heuristic, label,
                      use_attention=use_attention)
     env   = UAVEnvironment()
     if use_heuristic:
-        warmup_with_heuristic(agent, WARMUP_STEPS)
+        # Attention model gets more warmup (bigger model needs more data)
+        steps = 3000 if use_attention else WARMUP_STEPS
+        warmup_with_heuristic(agent, steps)
     latencies, drops, rewards, losses = [], [], [], []
     print(f"\n{'=' * 70}")
     print(f"  {label} -- {N_DEVICES} Devices, 1 UAV, {N_EPISODES} Episodes")
@@ -617,7 +636,7 @@ axes[0, 1].set_ylabel('Avg Latency (s)')
 axes[0, 1].legend(fontsize=7)
 axes[0, 1].grid(True)
 # ---- Plot 3: Convergence zoom (first 400 episodes) ----
-zoom_ep = 400
+zoom_ep = min(500, N_EPISODES)
 zoom_lines = [
     (attn_lat[:zoom_ep], 'crimson',    '-',  'Attention Heur DQN'),
     (heur_lat[:zoom_ep], 'blue',       '-.',  'Heuristic-Guided DQN'),
@@ -674,9 +693,9 @@ random.seed(SEED)
 np.random.seed(SEED)
 state_sample = env_attn.reset()
 with torch.no_grad():
-    state_t = torch.FloatTensor(state_sample).unsqueeze(0)
+    state_t = torch.FloatTensor(state_sample).unsqueeze(0).to(DEVICE)
     _ = attn_agent.model(state_t, return_attention=True)
-    attn_weights = attn_agent.model._attn_weights.squeeze(0).numpy()
+    attn_weights = attn_agent.model._attn_weights.squeeze(0).cpu().numpy()
 dev_labels = [f"D{i}" for i in range(N_DEVICES)]
 im = axes[1, 2].imshow(attn_weights, cmap='YlOrRd', aspect='equal',
                        vmin=0, vmax=attn_weights.max())
