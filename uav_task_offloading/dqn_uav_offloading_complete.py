@@ -278,7 +278,7 @@ class AttentionDuelingDQNNet(nn.Module):
     FEATURES_PER_DEVICE = 4   # (data_size, cpu_cycles, distance, has_task)
 
     def __init__(self, state_size, action_size,
-                 d_model=64, n_heads=2, n_layers=2, dropout=0.1):
+                 d_model=32, n_heads=2, n_layers=1, dropout=0.0):
         super().__init__()
         self.n_devices   = N_DEVICES
         self.d_model     = d_model
