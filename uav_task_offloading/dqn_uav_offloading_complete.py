@@ -3,26 +3,27 @@
 ================================================================================
 ATTENTION-ENHANCED HEURISTIC-GUIDED DQN FOR UAV TASK OFFLOADING
 ================================================================================
-Compares Standard DQN vs Heuristic-Guided DQN
-vs Attention-Enhanced Heuristic DQN (proposed)
+Per-Device Binary Decision Architecture -- Scales to any number of devices.
+Compares Standard DQN vs Heuristic-Guided DQN vs Attention-Enhanced Heuristic DQN
 for binary task offloading in UAV-assisted edge computing networks.
 To run: python dqn_uav_offloading_complete.py
 Dependencies: pip install numpy matplotlib torch
 ================================================================================
-KEY FEATURES:
+KEY ARCHITECTURAL CHANGE (vs previous 2^N action space version):
 ================================================================================
-1. Agent sees current tasks BEFORE deciding
-2. Double DQN prevents Q-value overestimation
-3. Gradient clipping prevents training divergence
-4. Soft target updates for smoother learning
-5. Larger replay buffer for better sample diversity
-6. Huber loss for robust training
-7. Cost-based heuristic-guided exploration for faster early convergence
-8. Heuristic warmup phase pre-fills replay buffer with quality experiences
-9. 10 devices / 1024 actions -- large action space where guidance matters
-10. Multi-Head Self-Attention: devices attend to each other's states,
-    learning inter-device dependencies (e.g. shared UAV queue contention)
-    for coordinated offloading decisions -- the proposed enhancement
+Instead of outputting Q-values for all 2^N joint actions (infeasible at N=20),
+each network outputs per-device binary Q-values: Q(s, local) and Q(s, offload)
+for each device independently. The total Q-value is the sum of per-device
+Q-values (Value Decomposition Network / VDN decomposition).
+
+This enables:
+  - Linear scaling with N (instead of exponential)
+  - Per-device attention embeddings that naturally map to per-device decisions
+  - 20+ devices where attention genuinely helps model inter-device dependencies
+
+Standard DQN:   shared MLP trunk -> per-device Q-values (no cross-device modeling)
+Attention DQN:  self-attention across device tokens -> per-device Q-values
+                (explicit cross-device dependency modeling)
 ================================================================================
 """
 import math
@@ -53,7 +54,7 @@ print(f"Using device: {DEVICE}")
 # =============================================================
 SLOT_DURATION  = 0.1
 TASK_PROB      = 0.7
-N_DEVICES      = 10
+N_DEVICES      = 20
 N_SLOTS        = 300
 N_EPISODES     = 1000
 F_LOCAL        = 0.5e9
@@ -67,6 +68,7 @@ CYCLES_MIN     = 1e6
 CYCLES_MAX     = 80e6
 UAV_POS = np.array([0, 0, 100])
 DEVICE_POSITIONS = [
+    # Original 10 devices
     np.array([50,   50,  0]),
     np.array([100,  30,  0]),
     np.array([150, 120,  0]),
@@ -77,14 +79,25 @@ DEVICE_POSITIONS = [
     np.array([180, 170,  0]),
     np.array([30,  100,  0]),
     np.array([250, 100,  0]),
+    # 10 additional devices (20-device scenario)
+    np.array([40,  180,  0]),
+    np.array([160,  40,  0]),
+    np.array([220, 140,  0]),
+    np.array([90,  220,  0]),
+    np.array([270,  50,  0]),
+    np.array([130, 190,  0]),
+    np.array([190, 110,  0]),
+    np.array([70,   70,  0]),
+    np.array([240, 200,  0]),
+    np.array([110, 130,  0]),
 ]
 DROP_PENALTY = 0.15
 DISTANCES    = [np.linalg.norm(UAV_POS - dp) for dp in DEVICE_POSITIONS]
 # Heuristic guidance settings
-HEUR_EPSILON_THRESHOLD = 0.6   # use heuristic when epsilon > 0.6
-HEUR_CALL_PROB         = 0.50  # 50% of exploration steps use heuristic
-HEUR_NOISE_PROB        = 0.05  # 5% chance to flip each device decision
-WARMUP_STEPS           = 2000  # pre-fill replay buffer with heuristic demos
+HEUR_EPSILON_THRESHOLD = 0.6
+HEUR_CALL_PROB         = 0.50
+HEUR_NOISE_PROB        = 0.05
+WARMUP_STEPS           = 3000
 # =============================================================
 #  COST-BASED HEURISTIC GUIDANCE FUNCTION
 # =============================================================
@@ -92,10 +105,7 @@ def heuristic_suggest_action(state, tasks):
     """
     Cost-based heuristic: computes actual local vs offload latency for
     each device, accounts for cumulative UAV queue, and picks the
-    lower-cost option.  Devices that MUST offload (local would drop)
-    are processed first to get priority queue access.
-    A small noise probability flips individual decisions to maintain
-    exploration diversity and prevent excessive bias in the replay buffer.
+    lower-cost option.  Returns a list of N_DEVICES binary decisions.
     """
     queue_time = state[-1] * SLOT_DURATION
     device_costs = []
@@ -136,15 +146,13 @@ def heuristic_suggest_action(state, tasks):
     for i in range(N_DEVICES):
         if random.random() < HEUR_NOISE_PROB:
             decisions[i] = 1 - decisions[i]
-    action = sum(d << i for i, d in enumerate(decisions))
-    return action
+    return decisions
 # =============================================================
 #  ENVIRONMENT
 # =============================================================
 class UAVEnvironment:
     def __init__(self):
-        self.state_size  = N_DEVICES * 4 + 1
-        self.action_size = 2 ** N_DEVICES
+        self.state_size = N_DEVICES * 4 + 1
     def reset(self):
         self.uav_queue_time = 0.0
         self.current_tasks  = self._generate_tasks()
@@ -175,9 +183,9 @@ class UAVEnvironment:
                 state.append(0.0)
         state.append(min(self.uav_queue_time / SLOT_DURATION, 1.0))
         return np.array(state, dtype=np.float32)
-    def step(self, action):
-        tasks     = self.current_tasks
-        decisions = [(action >> i) & 1 for i in range(N_DEVICES)]
+    def step(self, decisions):
+        """decisions: list of N_DEVICES binary values (0=local, 1=offload)."""
+        tasks = self.current_tasks
         total_latency = 0.0
         info = []
         for i in range(N_DEVICES):
@@ -213,175 +221,220 @@ class UAVEnvironment:
         next_state         = self._get_state(self.current_tasks)
         return next_state, reward, total_latency, info, tasks, decisions
 # =============================================================
-#  STANDARD DQN NETWORK
+#  STANDARD PER-DEVICE DQN NETWORK
 # =============================================================
-class DQNNet(nn.Module):
-    def __init__(self, state_size, action_size):
+class PerDeviceDQNNet(nn.Module):
+    """
+    Standard DQN with per-device binary decision heads.
+    A shared MLP trunk processes the full state, then a shared decision
+    head (conditioned on each device's own features) outputs Q(local)
+    and Q(offload) for every device.
+
+    Architecture:
+        state (81-d) -> trunk: 512->512->256
+        For each device i:
+            [trunk_output || device_i_features] -> shared head: 260->128->2
+        Output: (batch, N_DEVICES, 2) per-device Q-values
+
+    Total Q(s, a) = sum of per-device Q-values (VDN decomposition)
+    """
+    FEATURES_PER_DEVICE = 4
+
+    def __init__(self, state_size):
         super().__init__()
-        self.net = nn.Sequential(
+        self.n_devices = N_DEVICES
+        # Shared feature extractor
+        self.trunk = nn.Sequential(
             nn.Linear(state_size, 512),
             nn.ReLU(),
             nn.Linear(512, 512),
             nn.ReLU(),
             nn.Linear(512, 256),
             nn.ReLU(),
-            nn.Linear(256, action_size)
         )
+        # Shared decision head: trunk features + device-specific features -> 2
+        self.head = nn.Sequential(
+            nn.Linear(256 + self.FEATURES_PER_DEVICE, 128),
+            nn.ReLU(),
+            nn.Linear(128, 2),
+        )
+
     def forward(self, x):
-        return self.net(x)
+        """Returns (batch, N_DEVICES, 2) per-device Q-values."""
+        batch = x.shape[0]
+        features = self.trunk(x)                                    # (B, 256)
+
+        # Extract per-device features from state
+        device_feats = x[:, :self.n_devices * self.FEATURES_PER_DEVICE]
+        device_feats = device_feats.view(batch, self.n_devices,
+                                         self.FEATURES_PER_DEVICE)  # (B, N, 4)
+
+        # Expand trunk features to match device dimension
+        features_exp = features.unsqueeze(1).expand(
+            -1, self.n_devices, -1)                                 # (B, N, 256)
+
+        # Concatenate and apply shared head (vectorised, no loop)
+        combined = torch.cat([features_exp, device_feats], dim=2)   # (B, N, 260)
+        flat = combined.reshape(batch * self.n_devices, -1)         # (B*N, 260)
+        q_flat = self.head(flat)                                    # (B*N, 2)
+        return q_flat.view(batch, self.n_devices, 2)                # (B, N, 2)
 # =============================================================
-#  ATTENTION-ENHANCED DQN NETWORK  (proposed)
+#  ATTENTION-ENHANCED PER-DEVICE DQN NETWORK  (proposed)
 # =============================================================
-class AttentionDQNNet(nn.Module):
+class AttentionPerDeviceDQNNet(nn.Module):
     """
-    DQN whose feature extractor uses Multi-Head Self-Attention
-    over per-device token embeddings.  Each device's 4-dim state vector
-    (data_size, cpu_cycles, distance, has_task) is projected into an
-    embedding, positional-encoded, then fed through a Transformer-style
-    self-attention block.  This lets every device's representation be
-    informed by all other devices' workloads and channel conditions --
-    critical for coordinated offloading under a shared UAV queue.
+    Attention-Enhanced DQN with per-device binary decision heads.
+    Self-attention across device tokens enables coordinated decisions:
+    each device's embedding is enriched by information about ALL other
+    devices' workloads, channel conditions, and task requirements.
 
     Architecture:
-        state (41-d) -> split into 10 device tokens (4-d each) + 1 global (queue)
-                     -> Linear projection to d_model
+        state (81-d) -> split into 20 device tokens (4-d each) + queue (1-d)
+                     -> Linear projection to d_model (64)
                      -> + learned positional encoding
-                     -> Multi-Head Self-Attention (4 heads, 2 layers)
-                     -> concat attentive features + global queue
-                     -> FC layers -> Q-values
-    """
-    FEATURES_PER_DEVICE = 4   # (data_size, cpu_cycles, distance, has_task)
+                     -> 2-layer Multi-Head Self-Attention (4 heads)
+                     -> each device gets attention-enriched embedding
+        For each device i:
+            [attn_embedding_i || queue_embedding] -> shared head: 128->128->2
+        Output: (batch, N_DEVICES, 2) per-device Q-values
 
-    def __init__(self, state_size, action_size,
+    Why attention helps at 20 devices:
+        - 20 devices sharing one UAV queue = 380 pairwise interactions
+        - MLP trunk compresses all into a flat vector, losing structure
+        - Self-attention explicitly models which device pairs affect each other
+        - Device 5 can "see" that device 3 is offloading heavy work and stay local
+    """
+    FEATURES_PER_DEVICE = 4
+
+    def __init__(self, state_size,
                  d_model=64, n_heads=4, n_layers=2, dropout=0.1):
         super().__init__()
-        self.n_devices   = N_DEVICES
-        self.d_model     = d_model
-        self.action_size = action_size
+        self.n_devices = N_DEVICES
+        self.d_model   = d_model
 
-        # --- Per-device token projection ---
+        # Per-device token projection
         self.token_proj = nn.Linear(self.FEATURES_PER_DEVICE, d_model)
 
-        # --- Learned positional encoding for device slots ---
-        self.pos_embed = nn.Parameter(torch.randn(1, self.n_devices, d_model) * 0.02)
+        # Learned positional encoding for device slots
+        self.pos_embed = nn.Parameter(
+            torch.randn(1, self.n_devices, d_model) * 0.02)
 
-        # --- Transformer encoder layers ---
+        # Transformer encoder layers
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=n_heads,
             dim_feedforward=d_model * 4,
             dropout=dropout, batch_first=True,
             activation='gelu',
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer, num_layers=n_layers)
 
-        # --- Global queue feature projection ---
+        # Global queue feature projection
         self.queue_proj = nn.Linear(1, d_model)
 
-        # --- Merge: attention features + queue -> Q-values ---
-        merge_dim = d_model * self.n_devices + d_model
-        self.net = nn.Sequential(
-            nn.Linear(merge_dim, 512),
+        # Shared per-device decision head
+        self.head = nn.Sequential(
+            nn.Linear(d_model + d_model, 128),
             nn.ReLU(),
-            nn.Linear(512, 256),
-            nn.ReLU(),
-            nn.Linear(256, action_size),
+            nn.Linear(128, 2),
         )
 
         # For extracting attention weights during visualisation
         self._attn_weights = None
 
     def forward(self, x, return_attention=False):
+        """Returns (batch, N_DEVICES, 2) per-device Q-values."""
         batch = x.shape[0]
 
-        # Split state into per-device tokens and global queue feature
+        # Split state into per-device tokens and queue
         device_feats = x[:, :self.n_devices * self.FEATURES_PER_DEVICE]
-        device_feats = device_feats.view(batch, self.n_devices, self.FEATURES_PER_DEVICE)
-        queue_feat   = x[:, -1:]                        # (batch, 1)
+        device_feats = device_feats.view(
+            batch, self.n_devices, self.FEATURES_PER_DEVICE)
+        queue_feat = x[:, -1:]                                    # (B, 1)
 
-        # Project device tokens + add positional encoding
-        tokens = self.token_proj(device_feats)           # (batch, n_dev, d_model)
-        tokens = tokens + self.pos_embed
+        # Project tokens + positional encoding
+        tokens = self.token_proj(device_feats) + self.pos_embed   # (B, N, d)
 
         # Self-attention across devices
         if return_attention:
             attn_out, self._attn_weights = self._forward_with_attn(tokens)
         else:
-            attn_out = self.transformer(tokens)          # (batch, n_dev, d_model)
+            attn_out = self.transformer(tokens)                   # (B, N, d)
 
-        # Flatten attentive device representations
-        attn_flat = attn_out.reshape(batch, -1)          # (batch, n_dev * d_model)
+        # Queue embedding, expanded to all devices
+        queue_emb = self.queue_proj(queue_feat)                   # (B, d)
+        queue_exp = queue_emb.unsqueeze(1).expand(
+            -1, self.n_devices, -1)                               # (B, N, d)
 
-        # Queue embedding
-        queue_emb = self.queue_proj(queue_feat)          # (batch, d_model)
-
-        # Q-values
-        q = self.net(torch.cat([attn_flat, queue_emb], dim=1))
-
-        return q
+        # Concatenate attention embeddings + queue, apply shared head
+        combined = torch.cat([attn_out, queue_exp], dim=2)        # (B, N, 2d)
+        flat = combined.reshape(batch * self.n_devices, -1)       # (B*N, 2d)
+        q_flat = self.head(flat)                                  # (B*N, 2)
+        return q_flat.view(batch, self.n_devices, 2)              # (B, N, 2)
 
     def _forward_with_attn(self, tokens):
         """Run transformer manually to capture attention weights."""
         x = tokens
         weights_all = []
         for layer in self.transformer.layers:
-            # Self-attention with weight capture
             x2, w = layer.self_attn(x, x, x, need_weights=True,
                                     average_attn_weights=True)
             weights_all.append(w.detach())
             x = layer.norm1(x + layer.dropout1(x2))
             x = layer.norm2(x + layer._ff_block(x))
-        # Average attention across layers
-        avg_w = torch.stack(weights_all).mean(0)         # (batch, n_dev, n_dev)
+        avg_w = torch.stack(weights_all).mean(0)
         return x, avg_w
-
 # =============================================================
-#  GENERIC AGENT -- Standard DQN with optional Heuristic/Attention
+#  AGENT -- Per-Device DQN with VDN Decomposition
 # =============================================================
 class DQNAgent:
-    def __init__(self, state_size, action_size,
+    def __init__(self, state_size,
                  use_heuristic=False, use_attention=False):
-        self.state_size      = state_size
-        self.action_size     = action_size
-        self.use_heuristic   = use_heuristic
-        self.use_attention   = use_attention
+        self.state_size    = state_size
+        self.use_heuristic = use_heuristic
+        self.use_attention = use_attention
         self.heuristic_calls = 0
-        self.memory        = deque(maxlen=50000)
-        self.batch_size    = 128
-        self.gamma         = 0.95
-        self.epsilon       = 1.0
-        self.epsilon_min   = 0.01
+        self.memory      = deque(maxlen=50000)
+        self.batch_size  = 128
+        self.gamma       = 0.95
+        self.epsilon     = 1.0
+        self.epsilon_min = 0.01
         self.epsilon_decay = 0.99995
-        self.lr            = 0.0003
-        self.tau           = 0.005
+        self.lr          = 0.0003
+        self.tau         = 0.005
         if use_attention:
-            NetClass = AttentionDQNNet
+            self.model        = AttentionPerDeviceDQNNet(state_size).to(DEVICE)
+            self.target_model = AttentionPerDeviceDQNNet(state_size).to(DEVICE)
         else:
-            NetClass = DQNNet
-        self.model        = NetClass(state_size, action_size).to(DEVICE)
-        self.target_model = NetClass(state_size, action_size).to(DEVICE)
-        self.optimizer    = optim.Adam(self.model.parameters(), lr=self.lr)
-        self.loss_fn      = nn.SmoothL1Loss()
-        # LR warmup + cosine decay for attention model (critical for transformers)
-        self.scheduler     = None
-        self._step_count   = 0
+            self.model        = PerDeviceDQNNet(state_size).to(DEVICE)
+            self.target_model = PerDeviceDQNNet(state_size).to(DEVICE)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
+        self.loss_fn   = nn.SmoothL1Loss()
+        # LR warmup + cosine decay for attention model
+        self.scheduler = None
         if use_attention:
-            total_steps = N_EPISODES * N_SLOTS
-            warmup_steps_lr = 50 * N_SLOTS  # 50 episodes of linear warmup
+            total_steps    = N_EPISODES * N_SLOTS
+            warmup_steps_lr = 50 * N_SLOTS
             def lr_lambda(step):
                 if step < warmup_steps_lr:
-                    return step / max(1, warmup_steps_lr)  # linear warmup
-                progress = (step - warmup_steps_lr) / max(1, total_steps - warmup_steps_lr)
-                return 0.5 * (1.0 + math.cos(math.pi * progress))  # cosine decay
+                    return step / max(1, warmup_steps_lr)
+                progress = (step - warmup_steps_lr) / max(
+                    1, total_steps - warmup_steps_lr)
+                return 0.5 * (1.0 + math.cos(math.pi * progress))
             self.scheduler = torch.optim.lr_scheduler.LambdaLR(
                 self.optimizer, lr_lambda)
         self._hard_update_target()
+
     def _hard_update_target(self):
         self.target_model.load_state_dict(self.model.state_dict())
+
     def _soft_update_target(self):
         for tp, op in zip(self.target_model.parameters(),
                           self.model.parameters()):
             tp.data.copy_(self.tau * op.data + (1.0 - self.tau) * tp.data)
+
     def act(self, state, tasks=None):
+        """Returns list of N_DEVICES binary decisions."""
         if random.random() < self.epsilon:
             if (self.use_heuristic
                     and tasks is not None
@@ -390,29 +443,43 @@ class DQNAgent:
                 self.heuristic_calls += 1
                 return heuristic_suggest_action(state, tasks)
             else:
-                return random.randrange(self.action_size)
+                return [random.randint(0, 1) for _ in range(N_DEVICES)]
         else:
             with torch.no_grad():
-                q = self.model(torch.FloatTensor(state).unsqueeze(0).to(DEVICE))
-            return q.argmax().item()
+                q = self.model(
+                    torch.FloatTensor(state).unsqueeze(0).to(DEVICE))
+                # q: (1, N_DEVICES, 2) -> argmax per device
+            return q.squeeze(0).argmax(dim=1).cpu().tolist()
+
     def remember(self, s, a, r, s2):
+        """a is a list of N_DEVICES binary decisions."""
         self.memory.append((s, a, r, s2))
+
     def learn(self):
         if len(self.memory) < self.batch_size:
             return None
         batch       = random.sample(self.memory, self.batch_size)
         s, a, r, s2 = zip(*batch)
-        s  = torch.FloatTensor(np.array(s)).to(DEVICE)
-        a  = torch.LongTensor(a).to(DEVICE)
-        r  = torch.FloatTensor(r).to(DEVICE)
-        s2 = torch.FloatTensor(np.array(s2)).to(DEVICE)
-        current_q    = self.model(s).gather(1, a.unsqueeze(1)).squeeze()
+        s  = torch.FloatTensor(np.array(s)).to(DEVICE)        # (B, state)
+        a  = torch.LongTensor(np.array(a)).to(DEVICE)         # (B, N_DEVICES)
+        r  = torch.FloatTensor(r).to(DEVICE)                  # (B,)
+        s2 = torch.FloatTensor(np.array(s2)).to(DEVICE)       # (B, state)
+        # Per-device Q-values for current state
+        q_all     = self.model(s)                              # (B, N, 2)
+        current_q = q_all.gather(
+            2, a.unsqueeze(2)).squeeze(2)                      # (B, N)
+        # VDN: sum per-device Q-values to get total Q(s, a)
+        current_q_total = current_q.sum(dim=1)                 # (B,)
         with torch.no_grad():
-            best_actions = self.model(s2).argmax(1)
-            next_q       = self.target_model(s2).gather(
-                               1, best_actions.unsqueeze(1)).squeeze()
-        target_q = r + self.gamma * next_q
-        loss = self.loss_fn(current_q, target_q)
+            # Double DQN: online model selects, target model evaluates
+            q_next_online  = self.model(s2)                    # (B, N, 2)
+            best_actions   = q_next_online.argmax(dim=2)       # (B, N)
+            q_next_target  = self.target_model(s2)             # (B, N, 2)
+            next_q = q_next_target.gather(
+                2, best_actions.unsqueeze(2)).squeeze(2)       # (B, N)
+            next_q_total = next_q.sum(dim=1)                   # (B,)
+        target_q = r + self.gamma * next_q_total
+        loss = self.loss_fn(current_q_total, target_q)
         self.optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 10.0)
@@ -430,9 +497,9 @@ def warmup_with_heuristic(agent, warmup_steps):
     env_w = UAVEnvironment()
     state = env_w.reset()
     for _ in range(warmup_steps):
-        action     = heuristic_suggest_action(state, env_w.current_tasks)
-        next_state, reward, _, _, _, _ = env_w.step(action)
-        agent.remember(state, action, reward, next_state)
+        decisions  = heuristic_suggest_action(state, env_w.current_tasks)
+        next_state, reward, _, _, _, _ = env_w.step(decisions)
+        agent.remember(state, decisions, reward, next_state)
         state = next_state
         if random.random() < 1.0 / N_SLOTS:
             state = env_w.reset()
@@ -440,28 +507,29 @@ def warmup_with_heuristic(agent, warmup_steps):
 # =============================================================
 #  TRAINING FUNCTION
 # =============================================================
-def train_agent(state_size, action_size, use_heuristic, label,
-                use_attention=False):
-    # Reset seeds before each agent for fair comparison
+def train_agent(state_size, use_heuristic, label, use_attention=False):
     random.seed(SEED)
     np.random.seed(SEED)
     torch.manual_seed(SEED)
-    agent = DQNAgent(state_size, action_size,
+    agent = DQNAgent(state_size,
                      use_heuristic=use_heuristic,
                      use_attention=use_attention)
-    env   = UAVEnvironment()
+    env = UAVEnvironment()
     if use_heuristic:
-        # Attention model gets more warmup (bigger model needs more data)
-        steps = 3000 if use_attention else WARMUP_STEPS
+        steps = 5000 if use_attention else WARMUP_STEPS
         warmup_with_heuristic(agent, steps)
+    # Count parameters
+    n_params = sum(p.numel() for p in agent.model.parameters())
     latencies, drops, rewards, losses = [], [], [], []
-    print(f"\n{'=' * 70}")
+    print(f"\n{'=' * 75}")
     print(f"  {label} -- {N_DEVICES} Devices, 1 UAV, {N_EPISODES} Episodes")
-    print(f"  Action space: {action_size} actions")
+    print(f"  Per-device binary decisions (VDN decomposition)")
+    print(f"  Model parameters: {n_params:,}")
     if use_heuristic:
+        ws = 5000 if use_attention else WARMUP_STEPS
         print(f"  Heuristic guidance: ON  (eps>{HEUR_EPSILON_THRESHOLD}, "
-              f"call_prob={HEUR_CALL_PROB}, warmup={WARMUP_STEPS})")
-    print(f"{'=' * 70}")
+              f"call_prob={HEUR_CALL_PROB}, warmup={ws})")
+    print(f"{'=' * 75}")
     print(f"{'Episode':>8} | {'Avg Latency':>12} | {'Drop Rate':>10} | "
           f"{'Avg Loss':>10} | {'Epsilon':>8} | {'Heur calls':>10}")
     print("-" * 75)
@@ -472,9 +540,9 @@ def train_agent(state_size, action_size, use_heuristic, label,
         ep_reward  = 0.0
         ep_losses  = []
         for slot in range(N_SLOTS):
-            action = agent.act(state, tasks=env.current_tasks)
-            next_state, reward, total_lat, info, _, _ = env.step(action)
-            agent.remember(state, action, reward, next_state)
+            decisions = agent.act(state, tasks=env.current_tasks)
+            next_state, reward, total_lat, info, _, _ = env.step(decisions)
+            agent.remember(state, decisions, reward, next_state)
             loss_val = agent.learn()
             state      = next_state
             ep_reward += reward
@@ -525,24 +593,24 @@ def run_baseline(name, action_fn):
 # =============================================================
 #  TRAIN ALL AGENTS
 # =============================================================
-env_tmp     = UAVEnvironment()
-state_size  = env_tmp.state_size
-action_size = env_tmp.action_size
-print(f"State size: {state_size}, Action space: {action_size} ({N_DEVICES} devices)")
+env_tmp    = UAVEnvironment()
+state_size = env_tmp.state_size
+print(f"State size: {state_size} ({N_DEVICES} devices x 4 features + 1 queue)")
+print(f"Per-device binary decisions (VDN) -- scales linearly with N")
 print(f"Device distances: {[f'{d:.0f}m' for d in DISTANCES]}")
 # 1. Standard DQN
 std_lat,  std_drop,  std_rew,  std_loss,  _, std_agent  = train_agent(
-    state_size, action_size,
+    state_size,
     use_heuristic=False,
     label="Standard DQN")
 # 2. Heuristic-Guided DQN
 heur_lat, heur_drop, heur_rew, heur_loss, env_heur, heur_agent = train_agent(
-    state_size, action_size,
+    state_size,
     use_heuristic=True,
     label="Heuristic-Guided DQN")
 # 3. Attention-Enhanced Heuristic DQN -- proposed method
 attn_lat, attn_drop, attn_rew, attn_loss, env_attn, attn_agent = train_agent(
-    state_size, action_size,
+    state_size,
     use_heuristic=True, use_attention=True,
     label="Attention-Enhanced Heuristic DQN")
 # =============================================================
@@ -550,11 +618,11 @@ attn_lat, attn_drop, attn_rew, attn_loss, env_attn, attn_agent = train_agent(
 # =============================================================
 print("\nRunning baselines...")
 local_lat,   local_rew   = run_baseline("All Local",
-    lambda: 0)
+    lambda: [0] * N_DEVICES)
 offload_lat, offload_rew = run_baseline("All Offload",
-    lambda: 2**N_DEVICES - 1)
+    lambda: [1] * N_DEVICES)
 random_lat,  random_rew  = run_baseline("Random",
-    lambda: random.randrange(2**N_DEVICES))
+    lambda: [random.randint(0, 1) for _ in range(N_DEVICES)])
 # =============================================================
 #  CONVERGENCE SPEED COMPARISON
 # =============================================================
@@ -564,21 +632,29 @@ def moving_avg(data, w):
 print(f"\n{'=' * 60}")
 print(f"  CONVERGENCE SPEED")
 print(f"{'=' * 60}")
-target_lat = np.mean(attn_lat[-50:]) * 1.05
+# Use the best DQN agent's final performance as target
+all_final = {
+    "Attn Heur DQN": np.mean(attn_lat[-50:]),
+    "Heur DQN":      np.mean(heur_lat[-50:]),
+    "Standard DQN":  np.mean(std_lat[-50:]),
+}
+best_name = min(all_final, key=all_final.get)
+target_lat = all_final[best_name] * 1.05
+print(f"  Target: {target_lat:.4f}s (105% of {best_name}'s final)")
 for name, lat in [("Attn Heur DQN", attn_lat),
                   ("Heur DQN", heur_lat),
                   ("Standard DQN", std_lat)]:
     smoothed = moving_avg(lat, window)
     converged = [i for i, l in enumerate(smoothed) if l < target_lat]
     if converged:
-        print(f"  {name:<24}: reached {target_lat:.4f}s at episode {converged[0] + window}")
+        print(f"  {name:<24}: reached target at episode {converged[0] + window}")
     else:
-        print(f"  {name:<24}: did NOT reach {target_lat:.4f}s")
+        print(f"  {name:<24}: did NOT reach target")
 # =============================================================
 #  FINAL SUMMARY
 # =============================================================
 print(f"\n{'=' * 60}")
-print(f"  FINAL COMPARISON  ({N_DEVICES} devices, {action_size} actions)")
+print(f"  FINAL COMPARISON  ({N_DEVICES} devices, per-device VDN)")
 print(f"{'=' * 60}")
 results = [
     ("Attn Heur DQN",      np.mean(attn_lat[-50:])),
@@ -588,11 +664,15 @@ results = [
     ("All Offload",        np.mean(offload_lat[-50:])),
     ("All Local",          np.mean(local_lat[-50:])),
 ]
-best = results[0][1]
+best = min(r[1] for r in results)
 for name, val in results:
-    improvement = (1 - best/val)*100 if val != best else 0
-    marker = " <- proposed (attention)" if name == "Attn Heur DQN" else \
-             f"  ({improvement:.1f}% worse)" if improvement > 0 else ""
+    if val == best:
+        marker = " <- BEST"
+    else:
+        pct = (val - best) / best * 100
+        marker = f"  ({pct:.1f}% worse)"
+    if name == "Attn Heur DQN":
+        marker += "  [proposed]"
     print(f"  {name:<22}: {val:.4f}s{marker}")
 # =============================================================
 #  PLOTS -- 2x3 grid
@@ -601,7 +681,8 @@ os.makedirs('/mnt/user-data/outputs', exist_ok=True)
 x_range = range(window - 1, N_EPISODES)
 fig, axes = plt.subplots(2, 3, figsize=(22, 12))
 fig.suptitle(
-    f"Attention-Enhanced Heuristic DQN for UAV Task Offloading -- {N_DEVICES} Devices, 1 UAV",
+    f"Attention-Enhanced Heuristic DQN for UAV Task Offloading "
+    f"-- {N_DEVICES} Devices, 1 UAV, Per-Device VDN",
     fontsize=14, fontweight='bold')
 all_lines = [
     (attn_rew,   attn_lat,   'crimson',    '-',  'Attention Heur DQN (proposed)'),
@@ -635,7 +716,7 @@ axes[0, 1].set_xlabel('Episode')
 axes[0, 1].set_ylabel('Avg Latency (s)')
 axes[0, 1].legend(fontsize=7)
 axes[0, 1].grid(True)
-# ---- Plot 3: Convergence zoom (first 400 episodes) ----
+# ---- Plot 3: Convergence zoom (first 500 episodes) ----
 zoom_ep = min(500, N_EPISODES)
 zoom_lines = [
     (attn_lat[:zoom_ep], 'crimson',    '-',  'Attention Heur DQN'),
@@ -687,8 +768,7 @@ for bar, val in zip(bars, lat_vals):
 axes[1, 1].set_title('Final Average Latency (Last 50 Episodes)')
 axes[1, 1].set_ylabel('Avg Latency (s)')
 axes[1, 1].grid(True, axis='y')
-# ---- Plot 6: Attention Heatmap ----
-# Extract learned attention weights from the proposed model
+# ---- Plot 6: Attention Heatmap (20x20) ----
 random.seed(SEED)
 np.random.seed(SEED)
 state_sample = env_attn.reset()
@@ -701,18 +781,11 @@ im = axes[1, 2].imshow(attn_weights, cmap='YlOrRd', aspect='equal',
                        vmin=0, vmax=attn_weights.max())
 axes[1, 2].set_xticks(range(N_DEVICES))
 axes[1, 2].set_yticks(range(N_DEVICES))
-axes[1, 2].set_xticklabels(dev_labels, fontsize=8)
-axes[1, 2].set_yticklabels(dev_labels, fontsize=8)
+axes[1, 2].set_xticklabels(dev_labels, fontsize=6, rotation=45)
+axes[1, 2].set_yticklabels(dev_labels, fontsize=6)
 axes[1, 2].set_xlabel('Key Device')
 axes[1, 2].set_ylabel('Query Device')
 axes[1, 2].set_title('Learned Device Attention Weights')
-# Annotate cells
-for ii in range(N_DEVICES):
-    for jj in range(N_DEVICES):
-        axes[1, 2].text(jj, ii, f'{attn_weights[ii, jj]:.2f}',
-                        ha='center', va='center', fontsize=6,
-                        color='white' if attn_weights[ii, jj] > attn_weights.max()*0.6
-                        else 'black')
 plt.colorbar(im, ax=axes[1, 2], fraction=0.046, pad=0.04)
 plt.tight_layout()
 plt.savefig('/mnt/user-data/outputs/result_attn_heur_dqn.png',
