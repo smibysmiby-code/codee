@@ -12,10 +12,9 @@ IMPROVEMENTS OVER v1:
   2. 2000 episodes for full convergence
   3. Richer per-device state (6 features: +SNR, +local_feasibility)
   4. Deeper attention model (d_model=128, 3 layers, LayerNorm)
-  5. Multi-seed evaluation (3 seeds, mean +/- std, p-values)
-  6. Better attention visualization (averaged over 100 states)
-  7. Prioritized epsilon scheduling per agent type
-  8. Gradient clipping tuned per architecture
+  5. Better attention visualization (averaged over 100 states)
+  6. Prioritized epsilon scheduling per agent type
+  7. Gradient clipping tuned per architecture
 
 To run: python dqn_uav_offloading_complete.py
 Dependencies: pip install numpy matplotlib torch
@@ -29,7 +28,6 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 from collections import deque
-from scipy import stats
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -38,13 +36,12 @@ import os
 # =============================================================
 #  REPRODUCIBILITY
 # =============================================================
-BASE_SEED = 42
-SEEDS = [42, 123, 456]  # Multi-seed evaluation
-random.seed(BASE_SEED)
-np.random.seed(BASE_SEED)
-torch.manual_seed(BASE_SEED)
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
 if torch.cuda.is_available():
-    torch.cuda.manual_seed_all(BASE_SEED)
+    torch.cuda.manual_seed_all(SEED)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {DEVICE}")
 
@@ -550,12 +547,12 @@ def warmup_with_heuristic(agent, warmup_steps):
 # =============================================================
 #  TRAINING FUNCTION
 # =============================================================
-def train_agent(state_size, use_heuristic, label, use_attention=False, seed=42):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
+def train_agent(state_size, use_heuristic, label, use_attention=False):
+    random.seed(SEED)
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+        torch.cuda.manual_seed_all(SEED)
 
     agent = DQNAgent(state_size,
                      use_heuristic=use_heuristic,
@@ -570,7 +567,7 @@ def train_agent(state_size, use_heuristic, label, use_attention=False, seed=42):
     latencies, drops, rewards, losses = [], [], [], []
 
     print(f"\n{'=' * 75}")
-    print(f"  {label} (seed={seed}) -- {N_DEVICES} Devices, 1 UAV, "
+    print(f"  {label} -- {N_DEVICES} Devices, 1 UAV, "
           f"{N_EPISODES} Episodes")
     print(f"  Per-device binary decisions (VDN decomposition)")
     print(f"  Model parameters: {n_params:,}")
@@ -627,9 +624,9 @@ def train_agent(state_size, use_heuristic, label, use_attention=False, seed=42):
 # =============================================================
 #  BASELINE RUNNER
 # =============================================================
-def run_baseline(name, action_fn, seed=42):
-    random.seed(seed)
-    np.random.seed(seed)
+def run_baseline(name, action_fn):
+    random.seed(SEED)
+    np.random.seed(SEED)
     latencies, rewards = [], []
     for ep in range(N_EPISODES):
         env_b = UAVEnvironment()
@@ -646,7 +643,7 @@ def run_baseline(name, action_fn, seed=42):
     return latencies, rewards
 
 # =============================================================
-#  MULTI-SEED TRAINING & EVALUATION
+#  TRAIN ALL AGENTS (single seed)
 # =============================================================
 env_tmp    = UAVEnvironment()
 state_size = env_tmp.state_size
@@ -654,126 +651,37 @@ print(f"\nState size: {state_size} ({N_DEVICES} devices x {FEATURES_PER_DEVICE}"
       f" features + 1 queue)")
 print(f"Per-device binary decisions (VDN) -- scales linearly with N")
 print(f"Device distances: {[f'{d:.0f}m' for d in DISTANCES]}")
-print(f"\nRunning {len(SEEDS)} seeds: {SEEDS}")
-print(f"{'='*75}")
 
-# Storage for multi-seed results
-all_results = {
-    'std':  {'lats': [], 'rews': [], 'losses': []},
-    'heur': {'lats': [], 'rews': [], 'losses': []},
-    'attn': {'lats': [], 'rews': [], 'losses': []},
-    'local':   {'lats': [], 'rews': []},
-    'offload': {'lats': [], 'rews': []},
-    'random':  {'lats': [], 'rews': []},
-}
+# 1. Standard DQN
+std_lat, std_drop, std_rew, std_loss, _, std_agent = train_agent(
+    state_size, use_heuristic=False,
+    label="Standard DQN")
 
-# Keep last seed's agents/envs for attention visualization
-last_attn_agent = None
-last_attn_env   = None
+# 2. Heuristic-Guided DQN
+heur_lat, heur_drop, heur_rew, heur_loss, _, heur_agent = train_agent(
+    state_size, use_heuristic=True,
+    label="Heuristic-Guided DQN")
 
-for seed_idx, seed in enumerate(SEEDS):
-    print(f"\n{'#'*75}")
-    print(f"  SEED {seed_idx+1}/{len(SEEDS)}: {seed}")
-    print(f"{'#'*75}")
-
-    # 1. Standard DQN
-    lat, drop, rew, loss, _, _ = train_agent(
-        state_size, use_heuristic=False,
-        label="Standard DQN", seed=seed)
-    all_results['std']['lats'].append(lat)
-    all_results['std']['rews'].append(rew)
-    all_results['std']['losses'].append(loss)
-
-    # 2. Heuristic-Guided DQN
-    lat, drop, rew, loss, _, _ = train_agent(
-        state_size, use_heuristic=True,
-        label="Heuristic-Guided DQN", seed=seed)
-    all_results['heur']['lats'].append(lat)
-    all_results['heur']['rews'].append(rew)
-    all_results['heur']['losses'].append(loss)
-
-    # 3. Attention-Enhanced Heuristic DQN (proposed)
-    lat, drop, rew, loss, env_a, agent_a = train_agent(
-        state_size, use_heuristic=True, use_attention=True,
-        label="Attention-Enhanced Heuristic DQN", seed=seed)
-    all_results['attn']['lats'].append(lat)
-    all_results['attn']['rews'].append(rew)
-    all_results['attn']['losses'].append(loss)
-    last_attn_agent = agent_a
-    last_attn_env   = env_a
-
-    # Baselines
-    lat, rew = run_baseline("All Local",
-        lambda: [0] * N_DEVICES, seed=seed)
-    all_results['local']['lats'].append(lat)
-    all_results['local']['rews'].append(rew)
-
-    lat, rew = run_baseline("All Offload",
-        lambda: [1] * N_DEVICES, seed=seed)
-    all_results['offload']['lats'].append(lat)
-    all_results['offload']['rews'].append(rew)
-
-    lat, rew = run_baseline("Random",
-        lambda: [random.randint(0, 1) for _ in range(N_DEVICES)], seed=seed)
-    all_results['random']['lats'].append(lat)
-    all_results['random']['rews'].append(rew)
+# 3. Attention-Enhanced Heuristic DQN (proposed)
+attn_lat, attn_drop, attn_rew, attn_loss, env_attn, attn_agent = train_agent(
+    state_size, use_heuristic=True, use_attention=True,
+    label="Attention-Enhanced Heuristic DQN")
 
 # =============================================================
-#  AGGREGATE MULTI-SEED RESULTS
+#  BASELINES
 # =============================================================
-def mean_across_seeds(list_of_lists):
-    """Average episode-wise across seeds."""
-    return np.mean(list_of_lists, axis=0)
+print("\nRunning baselines...")
+local_lat, local_rew = run_baseline("All Local",
+    lambda: [0] * N_DEVICES)
+print(f"  All Local: {np.mean(local_lat):.4f}s")
 
-def std_across_seeds(list_of_lists):
-    return np.std(list_of_lists, axis=0)
+offload_lat, offload_rew = run_baseline("All Offload",
+    lambda: [1] * N_DEVICES)
+print(f"  All Offload: {np.mean(offload_lat):.4f}s")
 
-def final_latencies(key, last_n=100):
-    """Get per-seed final latencies (last N episodes)."""
-    return [np.mean(lat[-last_n:]) for lat in all_results[key]['lats']]
-
-# Compute averaged curves
-avg_lats  = {k: mean_across_seeds(v['lats']) for k, v in all_results.items()}
-std_lats  = {k: std_across_seeds(v['lats']) for k, v in all_results.items()}
-avg_rews  = {k: mean_across_seeds(v['rews']) for k, v in all_results.items()}
-
-# For loss curves (only DQN variants have losses)
-avg_losses = {}
-for k in ['std', 'heur', 'attn']:
-    avg_losses[k] = mean_across_seeds(all_results[k]['losses'])
-
-# =============================================================
-#  STATISTICAL SIGNIFICANCE (t-test)
-# =============================================================
-print(f"\n{'=' * 75}")
-print(f"  STATISTICAL ANALYSIS  ({N_DEVICES} devices, {len(SEEDS)} seeds)")
-print(f"{'=' * 75}")
-
-methods_stat = [
-    ("Attn Heur DQN", 'attn'),
-    ("Heur DQN",      'heur'),
-    ("Standard DQN",  'std'),
-    ("Random",        'random'),
-    ("All Offload",   'offload'),
-    ("All Local",     'local'),
-]
-
-final_100 = {}
-for name, key in methods_stat:
-    vals = final_latencies(key, last_n=100)
-    final_100[key] = vals
-    mean_val = np.mean(vals)
-    std_val  = np.std(vals)
-    print(f"  {name:<22}: {mean_val:.4f}s +/- {std_val:.4f}s  "
-          f"(seeds: {[f'{v:.4f}' for v in vals]})")
-
-# Pairwise t-tests: attention vs others
-print(f"\n  Pairwise t-tests (Attention vs others):")
-for name, key in methods_stat[1:]:
-    if len(SEEDS) >= 2:
-        t_stat, p_val = stats.ttest_ind(final_100['attn'], final_100[key])
-        sig = "***" if p_val < 0.01 else "**" if p_val < 0.05 else "*" if p_val < 0.1 else "n.s."
-        print(f"    vs {name:<20}: t={t_stat:+.3f}, p={p_val:.4f} {sig}")
+random_lat, random_rew = run_baseline("Random",
+    lambda: [random.randint(0, 1) for _ in range(N_DEVICES)])
+print(f"  Random: {np.mean(random_lat):.4f}s")
 
 # =============================================================
 #  CONVERGENCE SPEED COMPARISON
@@ -783,16 +691,22 @@ def moving_avg(data, w):
     return np.convolve(data, np.ones(w)/w, mode='valid')
 
 print(f"\n{'=' * 60}")
-print(f"  CONVERGENCE SPEED (averaged over {len(SEEDS)} seeds)")
+print(f"  CONVERGENCE SPEED")
 print(f"{'=' * 60}")
 
-target_lat = np.mean(final_100['attn']) * 1.05
-print(f"  Target: {target_lat:.4f}s (105% of Attn Heur DQN's final)")
+all_final = {
+    "Attn Heur DQN": np.mean(attn_lat[-100:]),
+    "Heur DQN":      np.mean(heur_lat[-100:]),
+    "Standard DQN":  np.mean(std_lat[-100:]),
+}
+best_name = min(all_final, key=all_final.get)
+target_lat = all_final[best_name] * 1.05
+print(f"  Target: {target_lat:.4f}s (105% of {best_name}'s final)")
 
-for name, key in [("Attn Heur DQN", 'attn'),
-                  ("Heur DQN", 'heur'),
-                  ("Standard DQN", 'std')]:
-    smoothed = moving_avg(avg_lats[key], window)
+for name, lat in [("Attn Heur DQN", attn_lat),
+                  ("Heur DQN", heur_lat),
+                  ("Standard DQN", std_lat)]:
+    smoothed = moving_avg(lat, window)
     converged = [i for i, l in enumerate(smoothed) if l < target_lat]
     if converged:
         print(f"  {name:<24}: reached target at episode {converged[0] + window}")
@@ -802,78 +716,70 @@ for name, key in [("Attn Heur DQN", 'attn'),
 # =============================================================
 #  FINAL SUMMARY TABLE
 # =============================================================
-print(f"\n{'=' * 75}")
-print(f"  FINAL COMPARISON  ({N_DEVICES} devices, {len(SEEDS)} seeds, "
-      f"last 100 episodes)")
-print(f"{'=' * 75}")
-
-best_mean = min(np.mean(final_100[k]) for _, k in methods_stat)
-for name, key in methods_stat:
-    mean_val = np.mean(final_100[key])
-    std_val  = np.std(final_100[key])
-    if mean_val == best_mean:
+print(f"\n{'=' * 60}")
+print(f"  FINAL COMPARISON  ({N_DEVICES} devices, per-device VDN)")
+print(f"{'=' * 60}")
+results = [
+    ("Attn Heur DQN",      np.mean(attn_lat[-100:])),
+    ("Heur DQN",           np.mean(heur_lat[-100:])),
+    ("Standard DQN",       np.mean(std_lat[-100:])),
+    ("Random",             np.mean(random_lat[-100:])),
+    ("All Offload",        np.mean(offload_lat[-100:])),
+    ("All Local",          np.mean(local_lat[-100:])),
+]
+best = min(r[1] for r in results)
+for name, val in results:
+    if val == best:
         marker = " <- BEST"
     else:
-        pct = (mean_val - best_mean) / best_mean * 100
+        pct = (val - best) / best * 100
         marker = f"  ({pct:.1f}% worse)"
-    if key == 'attn':
+    if name == "Attn Heur DQN":
         marker += "  [proposed]"
-    print(f"  {name:<22}: {mean_val:.4f}s +/- {std_val:.4f}s{marker}")
+    print(f"  {name:<22}: {val:.4f}s{marker}")
 
 # =============================================================
-#  PLOTS -- 3x3 grid (expanded visualization)
+#  PLOTS -- 2x3 grid
 # =============================================================
 os.makedirs('/mnt/user-data/outputs', exist_ok=True)
 x_range = range(window - 1, N_EPISODES)
 
-fig, axes = plt.subplots(3, 3, figsize=(24, 18))
+fig, axes = plt.subplots(2, 3, figsize=(22, 12))
 fig.suptitle(
     f"Attention-Enhanced Heuristic DQN for UAV Task Offloading\n"
-    f"{N_DEVICES} Devices, 1 UAV, {N_EPISODES} Episodes, "
-    f"{len(SEEDS)} Seeds (mean +/- std)",
+    f"{N_DEVICES} Devices, 1 UAV, {N_EPISODES} Episodes, Per-Device VDN",
     fontsize=14, fontweight='bold')
 
 all_lines = [
-    ('attn',    'crimson',    '-',   'Attention Heur DQN (proposed)'),
-    ('heur',    'blue',       '-.',  'Heuristic-Guided DQN'),
-    ('std',     'purple',     ':',   'Standard DQN'),
-    ('random',  'darkorange', ':',   'Random'),
-    ('offload', 'green',      '-.',  'All Offload'),
-    ('local',   'red',        '--',  'All Local'),
+    (attn_rew,   attn_lat,   'crimson',    '-',  'Attention Heur DQN (proposed)'),
+    (heur_rew,   heur_lat,   'blue',       '-.',  'Heuristic-Guided DQN'),
+    (std_rew,    std_lat,    'purple',     ':',  'Standard DQN'),
+    (random_rew, random_lat, 'darkorange', ':',  'Random'),
+    (offload_rew,offload_lat,'green',      '-.', 'All Offload'),
+    (local_rew,  local_lat,  'red',        '--', 'All Local'),
 ]
 
-# ---- Plot 1: Reward (mean +/- std shading) ----
-for key, color, style, label in all_lines:
-    smoothed = moving_avg(avg_rews[key], window)
-    axes[0, 0].plot(x_range, smoothed, color=color, linewidth=2.5,
+# ---- Plot 1: Reward ----
+for rew, _, color, style, label in all_lines:
+    axes[0, 0].plot(rew, alpha=0.1, color=color)
+    axes[0, 0].plot(x_range, moving_avg(rew, window),
+                    color=color, linewidth=2.5,
                     linestyle=style, label=label)
-    if len(SEEDS) > 1:
-        std_smooth = moving_avg(std_across_seeds(
-            all_results[key]['rews']), window)
-        axes[0, 0].fill_between(x_range,
-                                smoothed - std_smooth,
-                                smoothed + std_smooth,
-                                color=color, alpha=0.1)
-axes[0, 0].set_title('Episode Reward (mean +/- std)')
+axes[0, 0].set_title('Episode Reward')
 axes[0, 0].set_xlabel('Episode')
 axes[0, 0].set_ylabel('Total Reward')
-axes[0, 0].legend(fontsize=7, loc='lower right')
+axes[0, 0].legend(fontsize=7)
 axes[0, 0].grid(True, alpha=0.3)
 
-# ---- Plot 2: Latency (mean +/- std shading) ----
-for key, color, style, label in all_lines:
-    smoothed = moving_avg(avg_lats[key], window)
-    axes[0, 1].plot(x_range, smoothed, color=color, linewidth=2.5,
+# ---- Plot 2: Latency ----
+for _, lat, color, style, label in all_lines:
+    axes[0, 1].plot(lat, alpha=0.1, color=color)
+    axes[0, 1].plot(x_range, moving_avg(lat, window),
+                    color=color, linewidth=2.5,
                     linestyle=style, label=label)
-    if len(SEEDS) > 1:
-        std_smooth = moving_avg(std_lats[key], window)
-        axes[0, 1].fill_between(x_range,
-                                smoothed - std_smooth,
-                                smoothed + std_smooth,
-                                color=color, alpha=0.1)
 axes[0, 1].axhline(SLOT_DURATION, color='black', linestyle=':',
                    linewidth=1.5, label='SLA Limit')
-axes[0, 1].set_title('Average Latency per Episode (mean +/- std)')
+axes[0, 1].set_title('Average Latency per Episode')
 axes[0, 1].set_xlabel('Episode')
 axes[0, 1].set_ylabel('Avg Latency (s)')
 axes[0, 1].legend(fontsize=7)
@@ -882,24 +788,17 @@ axes[0, 1].grid(True, alpha=0.3)
 # ---- Plot 3: Convergence zoom (first 500 episodes) ----
 zoom_ep = min(500, N_EPISODES)
 zoom_lines = [
-    ('attn', 'crimson',    '-',  'Attention Heur DQN'),
-    ('heur', 'blue',       '-.',  'Heuristic-Guided DQN'),
-    ('std',  'purple',     ':',  'Standard DQN'),
+    (attn_lat[:zoom_ep], 'crimson',    '-',  'Attention Heur DQN'),
+    (heur_lat[:zoom_ep], 'blue',       '-.',  'Heuristic-Guided DQN'),
+    (std_lat[:zoom_ep],  'purple',     ':',  'Standard DQN'),
 ]
-for key, color, style, label in zoom_lines:
-    lat_zoom = avg_lats[key][:zoom_ep]
-    w = min(window, len(lat_zoom))
-    smoothed = moving_avg(lat_zoom, w)
-    axes[0, 2].plot(range(w-1, len(lat_zoom)), smoothed,
+for lat, color, style, label in zoom_lines:
+    axes[0, 2].plot(lat, alpha=0.15, color=color)
+    w = min(window, len(lat))
+    axes[0, 2].plot(range(w-1, len(lat)),
+                    moving_avg(lat, w),
                     color=color, linewidth=2.5,
                     linestyle=style, label=label)
-    if len(SEEDS) > 1:
-        std_zoom = std_lats[key][:zoom_ep]
-        std_smooth = moving_avg(std_zoom, w)
-        axes[0, 2].fill_between(range(w-1, len(lat_zoom)),
-                                smoothed - std_smooth,
-                                smoothed + std_smooth,
-                                color=color, alpha=0.15)
 axes[0, 2].set_title(f'Convergence Speed (First {zoom_ep} Episodes)')
 axes[0, 2].set_xlabel('Episode')
 axes[0, 2].set_ylabel('Avg Latency (s)')
@@ -907,14 +806,14 @@ axes[0, 2].legend(fontsize=8)
 axes[0, 2].grid(True, alpha=0.3)
 
 # ---- Plot 4: Training Loss ----
-loss_lines = [
-    ('attn', 'crimson',    '-',  'Attention Heur DQN'),
-    ('heur', 'blue',       '-.',  'Heuristic-Guided DQN'),
-    ('std',  'purple',     ':',  'Standard DQN'),
-]
-for key, color, style, label in loss_lines:
-    smoothed = moving_avg(avg_losses[key], window)
-    axes[1, 0].plot(x_range, smoothed, color=color, linewidth=2.5,
+for loss, color, style, label in [
+    (attn_loss, 'crimson',    '-',  'Attention Heur DQN'),
+    (heur_loss, 'blue',       '-.',  'Heuristic-Guided DQN'),
+    (std_loss,  'purple',     ':',  'Standard DQN'),
+]:
+    axes[1, 0].plot(loss, alpha=0.15, color=color)
+    axes[1, 0].plot(x_range, moving_avg(loss, window),
+                    color=color, linewidth=2.5,
                     linestyle=style, label=label)
 axes[1, 0].set_title('Training Loss')
 axes[1, 0].set_xlabel('Episode')
@@ -922,39 +821,37 @@ axes[1, 0].set_ylabel('Huber Loss')
 axes[1, 0].legend(fontsize=8)
 axes[1, 0].grid(True, alpha=0.3)
 
-# ---- Plot 5: Final Latency Bar with Error Bars ----
-methods_bar = ['Attn Heur\nDQN', 'Heur\nDQN', 'Standard\nDQN',
-               'Random', 'All\nOffload', 'All\nLocal']
-keys_bar    = ['attn', 'heur', 'std', 'random', 'offload', 'local']
-bar_colors  = ['crimson', 'blue', 'purple', 'darkorange', 'green', 'red']
-
-lat_means = [np.mean(final_100[k]) for k in keys_bar]
-lat_stds  = [np.std(final_100[k]) for k in keys_bar]
-
-bars = axes[1, 1].bar(methods_bar, lat_means, color=bar_colors,
-                      edgecolor='black', linewidth=0.8,
-                      yerr=lat_stds, capsize=5,
-                      error_kw={'linewidth': 2})
-for bar, val, std in zip(bars, lat_means, lat_stds):
+# ---- Plot 5: Final Latency Bar ----
+methods    = ['Attn Heur\nDQN', 'Heur\nDQN',
+              'Standard\nDQN', 'Random', 'All\nOffload', 'All\nLocal']
+lat_vals   = [np.mean(attn_lat[-100:]),    np.mean(heur_lat[-100:]),
+              np.mean(std_lat[-100:]),
+              np.mean(random_lat[-100:]),
+              np.mean(offload_lat[-100:]),  np.mean(local_lat[-100:])]
+bar_colors = ['crimson', 'blue', 'purple',
+              'darkorange', 'green', 'red']
+bars = axes[1, 1].bar(methods, lat_vals, color=bar_colors,
+                      edgecolor='black', linewidth=0.8)
+for bar, val in zip(bars, lat_vals):
     axes[1, 1].text(bar.get_x() + bar.get_width()/2,
-                    bar.get_height() + std + 0.002,
+                    bar.get_height() + 0.001,
                     f'{val:.4f}s', ha='center', va='bottom', fontsize=7,
                     fontweight='bold')
-axes[1, 1].set_title(f'Final Avg Latency (Last 100 Eps, {len(SEEDS)} seeds)')
+axes[1, 1].set_title('Final Average Latency (Last 100 Episodes)')
 axes[1, 1].set_ylabel('Avg Latency (s)')
 axes[1, 1].grid(True, axis='y', alpha=0.3)
 
 # ---- Plot 6: Attention Heatmap (averaged over 100 random states) ----
-random.seed(BASE_SEED)
-np.random.seed(BASE_SEED)
+random.seed(SEED)
+np.random.seed(SEED)
 n_attn_samples = 100
 attn_weights_accum = None
 for _ in range(n_attn_samples):
-    state_sample = last_attn_env.reset()
+    state_sample = env_attn.reset()
     with torch.no_grad():
         state_t = torch.FloatTensor(state_sample).unsqueeze(0).to(DEVICE)
-        _ = last_attn_agent.model(state_t, return_attention=True)
-        w = last_attn_agent.model._attn_weights.squeeze(0).cpu().numpy()
+        _ = attn_agent.model(state_t, return_attention=True)
+        w = attn_agent.model._attn_weights.squeeze(0).cpu().numpy()
         if attn_weights_accum is None:
             attn_weights_accum = w
         else:
@@ -972,77 +869,6 @@ axes[1, 2].set_xlabel('Key Device')
 axes[1, 2].set_ylabel('Query Device')
 axes[1, 2].set_title(f'Attention Weights (avg over {n_attn_samples} states)')
 plt.colorbar(im, ax=axes[1, 2], fraction=0.046, pad=0.04)
-
-# ---- Plot 7: Improvement % over baselines ----
-baseline_lat = np.mean(final_100['random'])
-improvements = {}
-for name, key in methods_stat:
-    mean_val = np.mean(final_100[key])
-    improvements[name] = (baseline_lat - mean_val) / baseline_lat * 100
-
-imp_methods = list(improvements.keys())
-imp_vals    = list(improvements.values())
-imp_colors  = ['crimson', 'blue', 'purple', 'darkorange', 'green', 'red']
-bars_imp = axes[2, 0].barh(imp_methods, imp_vals, color=imp_colors,
-                            edgecolor='black', linewidth=0.8)
-axes[2, 0].axvline(0, color='black', linewidth=0.5)
-for bar, val in zip(bars_imp, imp_vals):
-    axes[2, 0].text(val + 0.5 if val >= 0 else val - 5,
-                    bar.get_y() + bar.get_height()/2,
-                    f'{val:.1f}%', ha='left' if val >= 0 else 'right',
-                    va='center', fontsize=8, fontweight='bold')
-axes[2, 0].set_title('Latency Improvement vs Random Baseline')
-axes[2, 0].set_xlabel('Improvement (%)')
-axes[2, 0].grid(True, axis='x', alpha=0.3)
-
-# ---- Plot 8: Per-seed final latency comparison ----
-x_seeds = np.arange(len(SEEDS))
-width = 0.25
-for i, (name, key) in enumerate([
-    ("Attn Heur DQN", 'attn'),
-    ("Heur DQN", 'heur'),
-    ("Standard DQN", 'std'),
-]):
-    vals = final_100[key]
-    color = ['crimson', 'blue', 'purple'][i]
-    axes[2, 1].bar(x_seeds + i * width, vals, width,
-                   label=name, color=color, edgecolor='black', linewidth=0.5)
-axes[2, 1].set_xticks(x_seeds + width)
-axes[2, 1].set_xticklabels([f'Seed {s}' for s in SEEDS])
-axes[2, 1].set_ylabel('Final Avg Latency (s)')
-axes[2, 1].set_title('Per-Seed Performance Comparison')
-axes[2, 1].legend(fontsize=8)
-axes[2, 1].grid(True, axis='y', alpha=0.3)
-
-# ---- Plot 9: Network Topology with attention-weighted edges ----
-ax_topo = axes[2, 2]
-# Plot device positions
-for i, pos in enumerate(DEVICE_POSITIONS):
-    ax_topo.plot(pos[0], pos[1], 'bs', markersize=6)
-    ax_topo.annotate(f'D{i}', (pos[0]+5, pos[1]+5), fontsize=5)
-# Plot UAV
-ax_topo.plot(UAV_POS[0], UAV_POS[1], 'r^', markersize=15, label='UAV')
-# Draw attention-weighted edges between top device pairs
-top_k = 30  # show top 30 strongest attention connections
-attn_flat = []
-for i in range(N_DEVICES):
-    for j in range(N_DEVICES):
-        if i != j:
-            attn_flat.append((attn_weights_avg[i, j], i, j))
-attn_flat.sort(reverse=True)
-max_w = attn_flat[0][0]
-for w, i, j in attn_flat[:top_k]:
-    pi = DEVICE_POSITIONS[i]
-    pj = DEVICE_POSITIONS[j]
-    alpha = (w / max_w) * 0.6
-    axes[2, 2].plot([pi[0], pj[0]], [pi[1], pj[1]],
-                    'r-', alpha=alpha, linewidth=w/max_w * 3)
-ax_topo.set_title('Device Topology + Top Attention Edges')
-ax_topo.set_xlabel('X (m)')
-ax_topo.set_ylabel('Y (m)')
-ax_topo.legend(fontsize=8)
-ax_topo.grid(True, alpha=0.3)
-ax_topo.set_aspect('equal')
 
 plt.tight_layout()
 plt.savefig('/mnt/user-data/outputs/result_attn_heur_dqn.png',
